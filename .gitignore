@@ -24,14 +24,11 @@ logs/
 htmlcov/
 .coverage
 
-# Docker
-Dockerfile
-Dockerfile.*
-.dockerignore
+# Local data
+backend/.data/
 
 # Misc
 .idea/
 .vscode/
 .venv/
-backend/.data/
 frontend/dist/
