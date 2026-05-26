@@ -3,7 +3,6 @@ uvicorn[standard]==0.32.1
 httpx==0.28.1
 pydantic==2.10.3
 python-dotenv==1.0.1
-langgraph==1.2.0
-chromadb==1.5.9
-sentence-transformers==3.4.1
+langgraph==0.2.69
+chromadb==0.5.23
 PyJWT==2.10.1

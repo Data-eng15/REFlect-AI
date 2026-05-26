@@ -74,7 +74,13 @@ def get_chroma_collection():
     data_dir = Path(__file__).resolve().parents[1] / ".data" / "chroma"
     data_dir.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(data_dir))
-    return client.get_or_create_collection(RAG_COLLECTION)
+    # Pass embedding_function=None because we always supply our own vectors
+    # in upsert/query calls. This prevents chromadb from loading the default
+    # onnxruntime embedding model which is heavy (~200 MB) and unnecessary.
+    return client.get_or_create_collection(
+        RAG_COLLECTION,
+        embedding_function=None,  # type: ignore[arg-type]
+    )
 
 
 def index_and_retrieve(metadata: PaperMetadata, evidence: list[EvidenceItem], topics: list[str]) -> tuple[list[str], str, list[TraceLog]]:
