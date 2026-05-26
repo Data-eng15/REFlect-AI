@@ -8,3 +8,4 @@ chromadb==1.5.9
 sentence-transformers==3.4.1
 transformers==4.48.1
 torch==2.6.0
+PyJWT==2.10.1

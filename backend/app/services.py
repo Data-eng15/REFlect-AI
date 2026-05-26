@@ -444,8 +444,8 @@ def synthesize(
     limitations = []
     if not evidence:
         limitations.append("No citation evidence was retrieved from the available public APIs for this query.")
-    if not model_provider.startswith("hf:"):
-        limitations.append("HF SLM generation is optional and currently not active; set ENABLE_HF_GENERATION=1 to use a local Hugging Face instruct model.")
+    if model_provider == "deterministic":
+        limitations.append("AI narrative unavailable. Add GOOGLE_API_KEY to backend/.env for Gemini-powered summaries.")
         
     logs.append(log("Guardrail", "Faithfulness guardrail evaluated summary", faithfulness_score=faithfulness, status=guardrail_status))
     logs.append(log("Synthesis", "Summary generated", faithfulness_score=faithfulness, model_provider=model_provider))
