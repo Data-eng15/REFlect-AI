@@ -74,3 +74,4 @@ class AnalyzeResponse(BaseModel):
     guardrail_status: str = "not_run"
     limitations: list[str] = Field(default_factory=list)
     ref_report: str = ""
+    validation_report: dict = Field(default_factory=dict)

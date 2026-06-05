@@ -81,36 +81,392 @@ def year_from_crossref(work: dict[str, Any]) -> int | None:
         return None
 
 
+async def _semantic_scholar_title_search(
+    client: httpx.AsyncClient, query: str
+) -> tuple[PaperMetadata | None, int]:
+    """
+    Resolve a title query to the highest-impact paper using Semantic Scholar.
+
+    Strategy: autocomplete (lightweight, rarely rate-limited) → direct paper fetch
+    by the returned SS paper ID. Falls back to the /paper/search endpoint if needed.
+    """
+    ss_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+    headers = {"x-api-key": ss_key} if ss_key else {}
+    fields  = "title,year,authors,externalIds,citationCount,abstract"
+
+    # ── Step 1: autocomplete to get candidate paper IDs ──────────────────────
+    ac_ids: list[str] = []
+    try:
+        ac_resp = await client.get(
+            "https://api.semanticscholar.org/graph/v1/paper/autocomplete",
+            params={"query": query},
+            headers=headers,
+            timeout=10,
+        )
+        if ac_resp.is_success:
+            ac_ids = [m["id"] for m in ac_resp.json().get("matches", [])[:5] if m.get("id")]
+    except Exception:
+        pass
+
+    # ── Step 2: batch-fetch ALL candidate details in ONE request, retried
+    #            once on 429. Far more reliable than sequential per-ID calls,
+    #            so the canonical high-impact paper is never silently dropped.
+    best_meta: PaperMetadata | None = None
+    best_cites = 0
+    if ac_ids:
+        for attempt in range(2):
+            try:
+                br = await client.post(
+                    "https://api.semanticscholar.org/graph/v1/paper/batch",
+                    params={"fields": fields},
+                    json={"ids": ac_ids},
+                    headers=headers,
+                    timeout=15,
+                )
+                if br.status_code == 429 and attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
+                if not br.is_success:
+                    break
+                for p in br.json():
+                    if not p:
+                        continue
+                    doi   = (p.get("externalIds") or {}).get("DOI")
+                    arxiv = (p.get("externalIds") or {}).get("ArXiv")
+                    # Skip predatory republication-mill DOIs
+                    if doi and doi.lower().startswith("10.65215/"):
+                        continue
+                    cites = p.get("citationCount") or 0
+                    if cites > best_cites:
+                        best_meta = PaperMetadata(
+                            title=p.get("title", "Unknown"),
+                            authors=[a.get("name", "") for a in (p.get("authors") or [])[:8]],
+                            year=p.get("year"),
+                            doi=doi or (f"10.48550/arXiv.{arxiv}" if arxiv else None),
+                            abstract=p.get("abstract"),
+                        )
+                        best_cites = cites
+                break
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                break
+
+    if best_meta and best_cites > 0:
+        return best_meta, best_cites
+
+    # ── Step 3: fallback to /paper/search (may be rate-limited) ─────────────
+    for attempt in range(2):
+        try:
+            resp = await client.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={"query": query, "limit": 5, "fields": fields},
+                headers=headers,
+                timeout=12,
+            )
+            if resp.status_code == 429:
+                await asyncio.sleep(3)
+                continue
+            if not resp.is_success:
+                break
+            data = resp.json().get("data", [])
+            if data:
+                best = max(data, key=lambda p: p.get("citationCount") or 0)
+                doi   = (best.get("externalIds") or {}).get("DOI")
+                arxiv = (best.get("externalIds") or {}).get("ArXiv")
+                meta = PaperMetadata(
+                    title=best.get("title", "Unknown"),
+                    authors=[a.get("name", "") for a in (best.get("authors") or [])[:8]],
+                    year=best.get("year"),
+                    doi=doi or (f"10.48550/arXiv.{arxiv}" if arxiv else None),
+                    abstract=best.get("abstract"),
+                )
+                return meta, best.get("citationCount") or 0
+        except Exception:
+            break
+    return None, 0
+
+
+async def _openalex_title_search(
+    client: httpx.AsyncClient, query: str
+) -> tuple[PaperMetadata | None, int]:
+    """Search OpenAlex by title, filtered to exclude very-recent low-citation republications,
+    sorted by citation count descending — always surfaces the highest-impact version."""
+    try:
+        from datetime import datetime
+        current_year = datetime.now().year
+        fields = "title,doi,publication_year,cited_by_count,authorships,abstract_inverted_index"
+        # Fetch top 10 by citations for the title query
+        resp = await client.get(
+            "https://api.openalex.org/works",
+            params={
+                "filter": f"title.search:{query}",
+                "sort": "cited_by_count:desc",
+                "per-page": 10,
+                "select": fields,
+            },
+            timeout=12,
+        )
+        if not resp.is_success:
+            return None, 0
+        results = resp.json().get("results", [])
+        if not results:
+            return None, 0
+
+        # Filter out (a) predatory republication-mill DOIs, and (b) papers
+        # published in the last 2 years with <500 citations (likely recent
+        # republications of classic papers).
+        def _w_doi(w: dict) -> str:
+            return (w.get("doi") or "").lower().replace("https://doi.org/", "")
+        filtered = [
+            w for w in results
+            if not _w_doi(w).startswith("10.65215/")
+            and not (
+                (w.get("publication_year") or 0) >= current_year - 1
+                and (w.get("cited_by_count") or 0) < 500
+            )
+        ]
+        candidates = filtered if filtered else results
+        best = max(candidates, key=lambda w: w.get("cited_by_count") or 0)
+
+        doi_raw = best.get("doi", "") or ""
+        doi = doi_raw.replace("https://doi.org/", "") if doi_raw else None
+        authors = [
+            a.get("author", {}).get("display_name", "")
+            for a in (best.get("authorships") or [])[:8]
+        ]
+        abstract = inverted_abstract_to_text(best.get("abstract_inverted_index"))
+        meta = PaperMetadata(
+            title=best.get("title", "Unknown"),
+            authors=authors,
+            year=best.get("publication_year"),
+            doi=doi,
+            abstract=abstract,
+        )
+        return meta, best.get("cited_by_count") or 0
+    except Exception:
+        return None, 0
+
+
+# Module-level cache: resolved metadata + citation count, keyed by id.
+# Smooths over Semantic Scholar's aggressive anonymous rate limits so a paper
+# resolved once stays resolved for an hour.
+_meta_cache: dict[str, tuple[float, "PaperMetadata", int]] = {}
+_META_TTL = 3600
+
+
+def _meta_cache_get(key: str):
+    import time as _t
+    hit = _meta_cache.get(key)
+    if hit and (_t.time() - hit[0]) < _META_TTL:
+        return hit[1], hit[2]
+    return None
+
+
+def _meta_cache_put(key: str, meta: "PaperMetadata", cites: int) -> None:
+    import time as _t
+    _meta_cache[key] = (_t.time(), meta, cites)
+
+
+def _ss_paper_to_meta(p: dict) -> tuple[PaperMetadata | None, int]:
+    if not p:
+        return None, 0
+    ext = p.get("externalIds") or {}
+    doi = ext.get("DOI") or (f"10.48550/arXiv.{ext['ArXiv']}" if ext.get("ArXiv") else None)
+    meta = PaperMetadata(
+        title=p.get("title", "Unknown"),
+        authors=[a.get("name", "") for a in (p.get("authors") or [])[:8]],
+        year=p.get("year"),
+        doi=doi,
+        abstract=p.get("abstract"),
+    )
+    return meta, p.get("citationCount") or 0
+
+
+async def _ss_get_with_retries(client: httpx.AsyncClient, url: str, headers: dict,
+                               attempts: int = 4) -> dict | None:
+    """GET a Semantic Scholar paper endpoint, retrying on 429 with backoff.
+    Anonymous SS access shares a global ~1 req/s pool, so several retries are
+    often needed before a request lands in an open window."""
+    fields = "title,year,authors,externalIds,citationCount,abstract"
+    for attempt in range(attempts):
+        try:
+            r = await client.get(url, params={"fields": fields}, headers=headers, timeout=12)
+            if r.status_code == 429:
+                if attempt < attempts - 1:
+                    await asyncio.sleep(1.5 + attempt)  # 1.5, 2.5, 3.5s
+                    continue
+                return None
+            if r.is_success:
+                return r.json()
+            return None
+        except Exception:
+            if attempt < attempts - 1:
+                await asyncio.sleep(1.0)
+                continue
+            return None
+    return None
+
+
+async def _resolve_by_arxiv_native(client: httpx.AsyncClient, arxiv_id: str) -> PaperMetadata | None:
+    """Resolve an arXiv ID via arXiv's OWN API — free, no key, no rate limit.
+    This is the reliable primary path for arXiv DOIs; Semantic Scholar is only
+    used afterwards for citation-count enrichment."""
+    try:
+        r = await client.get("https://export.arxiv.org/api/query",
+                             params={"id_list": arxiv_id}, timeout=15)
+        if not r.is_success:
+            return None
+        xml = r.text
+        entries = xml.split("<entry>")
+        if len(entries) < 2:
+            return None
+        e = entries[1]
+        t = re.search(r"<title>(.*?)</title>", e, re.DOTALL)
+        title = re.sub(r"\s+", " ", t.group(1)).strip() if t else "Unknown"
+        p = re.search(r"<published>(\d{4})", e)
+        year = int(p.group(1)) if p else None
+        authors = [a.strip() for a in re.findall(r"<name>(.*?)</name>", e)][:8]
+        summ = re.search(r"<summary>(.*?)</summary>", e, re.DOTALL)
+        abstract = re.sub(r"\s+", " ", summ.group(1)).strip() if summ else None
+        return PaperMetadata(
+            title=title, authors=authors, year=year,
+            doi=f"10.48550/arXiv.{arxiv_id}", abstract=abstract,
+            source_url=f"https://arxiv.org/abs/{arxiv_id}",
+        )
+    except Exception:
+        return None
+
+
+async def _resolve_by_arxiv(client: httpx.AsyncClient, arxiv_id: str) -> PaperMetadata | None:
+    """Resolve an arXiv ID: arXiv native API first (reliable), SS fallback (cached)."""
+    cache_key = f"arxiv:{arxiv_id.lower()}"
+    cached = _meta_cache_get(cache_key)
+    if cached:
+        return cached[0]
+
+    # 1. arXiv native API — reliable, unthrottled
+    meta = await _resolve_by_arxiv_native(client, arxiv_id)
+    if meta:
+        _meta_cache_put(cache_key, meta, 0)
+        return meta
+
+    # 2. Semantic Scholar fallback
+    ss_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+    headers = {"x-api-key": ss_key} if ss_key else {}
+    data = await _ss_get_with_retries(
+        client, f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}", headers)
+    meta, cites = _ss_paper_to_meta(data) if data else (None, 0)
+    if meta:
+        _meta_cache_put(cache_key, meta, cites)
+    return meta
+
+
+async def _resolve_by_ss_doi(client: httpx.AsyncClient, doi: str) -> PaperMetadata | None:
+    """Resolve a DOI to metadata via Semantic Scholar (cached, retried)."""
+    cache_key = f"doi:{doi.lower()}"
+    cached = _meta_cache_get(cache_key)
+    if cached:
+        return cached[0]
+    ss_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+    headers = {"x-api-key": ss_key} if ss_key else {}
+    data = await _ss_get_with_retries(
+        client, f"https://api.semanticscholar.org/graph/v1/paper/DOI:{quote(doi, safe='')}", headers)
+    meta, cites = _ss_paper_to_meta(data) if data else (None, 0)
+    if meta:
+        _meta_cache_put(cache_key, meta, cites)
+    return meta
+
+
 async def fetch_crossref(client: httpx.AsyncClient, query: str) -> tuple[PaperMetadata | None, list[TraceLog]]:
     logs = [log("Metadata", "Resolving input with CrossRef")]
     doi = extract_doi(query)
     try:
         if doi:
+            # arXiv DOIs (10.48550/arXiv.XXXX) are registered with DataCite,
+            # NOT CrossRef — resolve those via Semantic Scholar instead.
+            arxiv_m = re.search(r"10\.48550/arxiv\.(.+)$", doi, re.IGNORECASE)
+            if arxiv_m:
+                arxiv_id = arxiv_m.group(1)
+                meta = await _resolve_by_arxiv(client, arxiv_id)
+                if meta:
+                    logs.append(log("Metadata", "Metadata resolved via arXiv/Semantic Scholar",
+                                    title=meta.title, doi=meta.doi))
+                    return meta, logs
+                # fall through to CrossRef attempt if SS failed
+
+            # Standard DOI lookup — CrossRef is authoritative
             url = f"https://api.crossref.org/works/{quote(doi, safe='')}"
             response = await client.get(url, timeout=12)
-            response.raise_for_status()
-            work = response.json()["message"]
+            if response.is_success:
+                work = response.json()["message"]
+                title = (work.get("title") or ["Unknown title"])[0]
+                metadata = PaperMetadata(
+                    title=title,
+                    authors=authors_from_crossref(work),
+                    year=year_from_crossref(work),
+                    doi=work.get("DOI"),
+                    abstract=clean_abstract(work.get("abstract")),
+                    source_url=work.get("URL"),
+                )
+                logs.append(log("Metadata", "Metadata resolved via DOI", title=metadata.title, doi=metadata.doi))
+                return metadata, logs
+            # CrossRef miss — last-ditch Semantic Scholar DOI lookup
+            meta = await _resolve_by_ss_doi(client, doi)
+            if meta:
+                logs.append(log("Metadata", "Metadata resolved via Semantic Scholar DOI",
+                                title=meta.title, doi=meta.doi))
+                return meta, logs
+            logs.append(log("Metadata", "DOI not found in CrossRef or Semantic Scholar", doi=doi))
+            return None, logs
         else:
+            # Title/free-text query.
+            # Strategy: try three sources in order, pick whichever resolves to
+            # the HIGHEST citation count — that is always the most-impactful paper.
+            logs.append(log("Metadata", "Title query — resolving to highest-impact paper"))
+
+            # 1. Semantic Scholar (best citation data, may be rate-limited)
+            ss_meta, ss_cites = await _semantic_scholar_title_search(client, query)
+
+            # 2. OpenAlex (free, no key needed, filters out recent republications)
+            oa_meta, oa_cites = await _openalex_title_search(client, query)
+
+            # Pick whichever source gave the higher citation count
+            if ss_cites > 0 or oa_cites > 0:
+                if ss_cites >= oa_cites and ss_meta:
+                    chosen, cites, source = ss_meta, ss_cites, "Semantic Scholar"
+                else:
+                    chosen, cites, source = oa_meta, oa_cites, "OpenAlex"
+                logs.append(log("Metadata", f"Resolved via {source} — highest-impact match",
+                                title=chosen.title, year=chosen.year,
+                                citations=cites, doi=chosen.doi))
+                return chosen, logs
+
+            # 3. Last resort: CrossRef top-5, pick by citation count
             url = "https://api.crossref.org/works"
-            response = await client.get(url, params={"query.title": query, "rows": 1}, timeout=12)
+            response = await client.get(url, params={"query.title": query, "rows": 5}, timeout=12)
             response.raise_for_status()
             items = response.json()["message"].get("items", [])
+            # Drop predatory republication-mill DOIs
+            items = [w for w in items
+                     if not (w.get("DOI") or "").lower().startswith("10.65215/")] or items
             if not items:
-                logs.append(log("Metadata", "No CrossRef match found"))
+                logs.append(log("Metadata", "No match found across all sources"))
                 return None, logs
-            work = items[0]
-
-        title = (work.get("title") or ["Unknown title"])[0]
-        metadata = PaperMetadata(
-            title=title,
-            authors=authors_from_crossref(work),
-            year=year_from_crossref(work),
-            doi=work.get("DOI"),
-            abstract=clean_abstract(work.get("abstract")),
-            source_url=work.get("URL"),
-        )
-        logs.append(log("Metadata", "Metadata resolved", title=metadata.title, doi=metadata.doi))
-        return metadata, logs
+            work = max(items, key=lambda w: w.get("is-referenced-by-count", 0))
+            title = (work.get("title") or ["Unknown title"])[0]
+            metadata = PaperMetadata(
+                title=title,
+                authors=authors_from_crossref(work),
+                year=year_from_crossref(work),
+                doi=work.get("DOI"),
+                abstract=clean_abstract(work.get("abstract")),
+                source_url=work.get("URL"),
+            )
+            logs.append(log("Metadata", "Resolved via CrossRef fallback",
+                            title=metadata.title, doi=metadata.doi))
+            return metadata, logs
     except Exception as exc:
         logs.append(log("Metadata", "CrossRef lookup failed", error=str(exc)))
         return None, logs
@@ -142,7 +498,14 @@ async def fetch_semantic_scholar(client: httpx.AsyncClient, metadata: PaperMetad
 
     try:
         url = f"https://api.semanticscholar.org/graph/v1/paper/{quote(paper_id, safe='')}"
-        response = await client.get(url, params={"fields": fields}, headers=headers, timeout=15)
+        # Retry once on 429 (rate-limit) with a short back-off
+        for attempt in range(2):
+            response = await client.get(url, params={"fields": fields}, headers=headers, timeout=20)
+            if response.status_code == 429 and attempt == 0:
+                logs.append(log("Scholar", "Rate-limited by Semantic Scholar, retrying in 5 s"))
+                await asyncio.sleep(5)
+                continue
+            break
         response.raise_for_status()
         payload = response.json()
         citations = payload.get("citations", [])[:20]
@@ -315,6 +678,295 @@ async def fetch_github_adoption(client: httpx.AsyncClient, metadata: PaperMetada
         return [], logs
 
 
+async def fetch_pubmed(client: httpx.AsyncClient, metadata: PaperMetadata) -> tuple[list[EvidenceItem], list[TraceLog]]:
+    """Search PubMed via E-utilities for citing articles and related biomedical literature.
+    Free, no API key required, excellent coverage for medical/life-science papers."""
+    logs = [log("PubMed", "Searching PubMed E-utilities")]
+    title = metadata.title.strip()
+    if not title or title == "Unknown title":
+        return [], logs
+    try:
+        # Step 1: search for article IDs matching the title
+        search_resp = await client.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={"db": "pubmed", "term": f'"{title}"[Title]', "retmax": 8,
+                    "retmode": "json", "tool": "veritrace", "email": "research@veritrace.ai"},
+            timeout=15,
+        )
+        if not search_resp.is_success:
+            logs.append(log("PubMed", "Search failed", status=search_resp.status_code))
+            return [], logs
+
+        pmids = search_resp.json().get("esearchresult", {}).get("idlist", [])
+        if not pmids:
+            # Broader fallback: use DOI or first three title words
+            term = metadata.doi if metadata.doi else " ".join(title.split()[:5])
+            search_resp2 = await client.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                params={"db": "pubmed", "term": term, "retmax": 6,
+                        "retmode": "json", "tool": "veritrace", "email": "research@veritrace.ai"},
+                timeout=15,
+            )
+            if search_resp2.is_success:
+                pmids = search_resp2.json().get("esearchresult", {}).get("idlist", [])
+
+        if not pmids:
+            logs.append(log("PubMed", "No PubMed matches found"))
+            return [], logs
+
+        # Step 2: fetch summaries for those IDs
+        summary_resp = await client.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            params={"db": "pubmed", "id": ",".join(pmids[:6]), "retmode": "json",
+                    "tool": "veritrace", "email": "research@veritrace.ai"},
+            timeout=15,
+        )
+        if not summary_resp.is_success:
+            return [], logs
+
+        result = summary_resp.json().get("result", {})
+        evidence: list[EvidenceItem] = []
+        for pmid in pmids[:6]:
+            art = result.get(pmid, {})
+            if not art or pmid == "uids":
+                continue
+            art_title = art.get("title", "")
+            pub_date = art.get("pubdate", "")
+            year = int(pub_date[:4]) if pub_date[:4].isdigit() else None
+            authors_raw = art.get("authors", [])
+            authors = [a.get("name", "") for a in authors_raw[:5]]
+            source = art.get("source", "PubMed")
+            uid_doi = next((e.get("value") for e in art.get("articleids", []) if e.get("idtype") == "doi"), None)
+            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            evidence.append(EvidenceItem(
+                title=art_title,
+                url=url,
+                year=year,
+                authors=authors,
+                snippet=f"PubMed record. Journal: {source}.",
+                source="PubMed",
+                kind="citation",
+                metric_label="PMID",
+                metric_value=pmid,
+            ))
+
+        logs.append(log("PubMed", "PubMed evidence retrieved", items=len(evidence)))
+        return evidence, logs
+    except Exception as exc:
+        logs.append(log("PubMed", "PubMed search failed", error=str(exc)))
+        return [], logs
+
+
+async def fetch_clinical_trials(client: httpx.AsyncClient, metadata: PaperMetadata) -> tuple[list[EvidenceItem], list[TraceLog]]:
+    """Search ClinicalTrials.gov for trials that reference this paper's intervention or topic.
+    Free, no API key, critical for biomedical impact evidence."""
+    logs = [log("ClinicalTrials", "Searching ClinicalTrials.gov")]
+    title = metadata.title.strip()
+    if not title or title == "Unknown title":
+        return [], logs
+    # Only meaningful for biomedical/clinical papers — skip if clearly CS/maths
+    cs_keywords = {"network", "algorithm", "learning", "graph", "neural", "transformer",
+                   "attention", "model", "compiler", "database", "protocol"}
+    title_lower = title.lower()
+    if sum(1 for kw in cs_keywords if kw in title_lower) >= 2:
+        logs.append(log("ClinicalTrials", "Skipped — paper appears non-biomedical"))
+        return [], logs
+    try:
+        search_terms = " ".join(title.split()[:6])
+        resp = await client.get(
+            "https://clinicaltrials.gov/api/v2/studies",
+            params={"query.term": search_terms, "pageSize": 5,
+                    "fields": "NCTId,BriefTitle,OverallStatus,StartDate,Condition,InterventionName"},
+            timeout=15,
+        )
+        if not resp.is_success:
+            logs.append(log("ClinicalTrials", "API call failed", status=resp.status_code))
+            return [], logs
+
+        studies = resp.json().get("studies", [])
+        evidence: list[EvidenceItem] = []
+        for study in studies[:5]:
+            proto = study.get("protocolSection", {})
+            id_mod = proto.get("identificationModule", {})
+            status_mod = proto.get("statusModule", {})
+            nct_id = id_mod.get("nctId", "")
+            trial_title = id_mod.get("briefTitle", nct_id)
+            overall_status = status_mod.get("overallStatus", "")
+            start_date = status_mod.get("startDateStruct", {}).get("date", "")
+            year = int(start_date[:4]) if start_date[:4].isdigit() else None
+            cond_mod = proto.get("conditionsModule", {})
+            conditions = ", ".join(cond_mod.get("conditions", [])[:3])
+            snippet = f"Clinical trial ({overall_status}). Conditions: {conditions}." if conditions else f"Clinical trial ({overall_status})."
+            evidence.append(EvidenceItem(
+                title=trial_title,
+                url=f"https://clinicaltrials.gov/study/{nct_id}",
+                year=year,
+                authors=[],
+                snippet=snippet,
+                source="ClinicalTrials.gov",
+                kind="clinical",
+                metric_label="NCT ID",
+                metric_value=nct_id,
+            ))
+
+        logs.append(log("ClinicalTrials", "ClinicalTrials.gov evidence retrieved", items=len(evidence)))
+        return evidence, logs
+    except Exception as exc:
+        logs.append(log("ClinicalTrials", "ClinicalTrials.gov search failed", error=str(exc)))
+        return [], logs
+
+
+async def fetch_soft_sciences(client: httpx.AsyncClient, metadata: PaperMetadata, topics: list[str] | None = None) -> tuple[list[EvidenceItem], list[TraceLog]]:
+    """Humanities / social-science / policy evidence — closes the soft-sciences
+    coverage gap left by GitHub, PubMed, and Semantic Scholar.
+
+    Two free, no-key sources queried concurrently:
+      * GOV.UK Search API   -> UK policy documents (kind="policy") — direct REF
+                               social-impact evidence (policy influence).
+      * OpenAIRE Research Graph -> SSH research outputs and monographs
+                               (kind="monograph").
+    """
+    logs = [log("SoftSci", "Searching policy portals and SSH repositories")]
+    title = metadata.title.strip()
+    if not title or title == "Unknown title":
+        return [], logs
+
+    # Distinctive paper terms used to filter out generic false-positive matches
+    # (e.g. a CS "attention" paper should not collect welfare-policy documents).
+    paper_terms = set(meaningful_title_terms(title))
+    if topics:
+        for t in topics:
+            paper_terms.update(
+                w for w in re.findall(r"[a-z0-9]+", t.lower()) if len(w) > 4
+            )
+
+    def _relevant(item_title: str, item_snippet: str) -> bool:
+        """Keep an item only if it shares a distinctive term with the paper."""
+        if not paper_terms:
+            return True
+        hay = f"{item_title} {item_snippet}".lower()
+        return any(term in hay for term in paper_terms)
+
+    # Build a topic-aware query: title head + 1-2 high-signal topic terms
+    title_terms = meaningful_title_terms(title)
+    query_terms = title_terms[:5]
+    if topics:
+        for t in topics[:2]:
+            for w in re.findall(r"[a-z0-9]+", t.lower()):
+                if len(w) > 3 and w not in query_terms:
+                    query_terms.append(w)
+    query = " ".join(query_terms[:6]) or " ".join(title.split()[:5])
+
+    evidence: list[EvidenceItem] = []
+
+    # ── GOV.UK policy portal ────────────────────────────────────────────────
+    async def _govuk() -> list[EvidenceItem]:
+        out: list[EvidenceItem] = []
+        try:
+            r = await client.get(
+                "https://www.gov.uk/api/search.json",
+                params={"q": query, "count": 4,
+                        "fields": "title,link,description,public_timestamp,format,organisations"},
+                timeout=12,
+            )
+            if not r.is_success:
+                return out
+            for res in r.json().get("results", [])[:6]:
+                item_title = res.get("title", "UK policy document")
+                desc = (res.get("description") or "")[:200]
+                if not _relevant(item_title, desc):
+                    continue
+                ts = res.get("public_timestamp", "") or ""
+                yr = int(ts[:4]) if ts[:4].isdigit() else None
+                orgs = res.get("organisations", []) or []
+                org_name = orgs[0].get("title", "") if orgs and isinstance(orgs[0], dict) else ""
+                link = res.get("link", "")
+                full_url = link if link.startswith("http") else f"https://www.gov.uk{link}"
+                out.append(EvidenceItem(
+                    title=item_title,
+                    url=full_url,
+                    year=yr,
+                    authors=[org_name] if org_name else [],
+                    snippet=f"UK Government policy document ({res.get('format','')}). {desc}",
+                    source="GOV.UK",
+                    kind="policy",
+                    metric_label="Dept" if org_name else None,
+                    metric_value=org_name[:25] if org_name else None,
+                ))
+                if len(out) >= 4:
+                    break
+        except Exception:
+            pass
+        return out
+
+    # ── OpenAIRE SSH / monographs ───────────────────────────────────────────
+    async def _openaire() -> list[EvidenceItem]:
+        out: list[EvidenceItem] = []
+        try:
+            r = await client.get(
+                "https://api.openaire.eu/search/publications",
+                params={"keywords": query, "format": "json", "size": 4},
+                timeout=15,
+            )
+            if not r.is_success:
+                return out
+            results = r.json().get("response", {}).get("results", {}).get("result", [])
+            if isinstance(results, dict):
+                results = [results]
+            for res in (results or [])[:6]:
+                try:
+                    md = (res.get("metadata", {}) or {}).get("oaf:entity", {}).get("oaf:result", {})
+                    t = md.get("title")
+                    if isinstance(t, list):
+                        t = t[0]
+                    title_str = (t.get("$") if isinstance(t, dict) else t) or "SSH research output"
+                    title_str = title_str if isinstance(title_str, str) else str(title_str)
+                    rtype = (md.get("resulttype", {}) or {}).get("@classname", "publication")
+                    if not _relevant(title_str, rtype):
+                        continue
+                    date_str = (md.get("dateofacceptance", {}) or {}).get("$", "") or ""
+                    yr = int(date_str[:4]) if date_str[:4].isdigit() else None
+                    # Best-effort DOI / landing page
+                    pid = md.get("pid")
+                    doi_val = None
+                    if isinstance(pid, list):
+                        for p in pid:
+                            if isinstance(p, dict) and p.get("@classid") == "doi":
+                                doi_val = p.get("$")
+                                break
+                    elif isinstance(pid, dict) and pid.get("@classid") == "doi":
+                        doi_val = pid.get("$")
+                    url_val = f"https://doi.org/{doi_val}" if doi_val else None
+                    kind = "monograph" if "book" in rtype.lower() else "ssh"
+                    out.append(EvidenceItem(
+                        title=title_str,
+                        url=url_val,
+                        year=yr,
+                        authors=[],
+                        snippet=f"OpenAIRE {rtype} — humanities/social-science research output.",
+                        source="OpenAIRE",
+                        kind=kind,
+                        metric_label="Type",
+                        metric_value=rtype[:20],
+                    ))
+                    if len(out) >= 4:
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    try:
+        govuk_ev, openaire_ev = await asyncio.gather(_govuk(), _openaire())
+        evidence = govuk_ev + openaire_ev
+        logs.append(log("SoftSci", "Policy & SSH evidence retrieved",
+                        policy=len(govuk_ev), ssh=len(openaire_ev)))
+    except Exception as exc:
+        logs.append(log("SoftSci", "Soft-sciences search failed", error=str(exc)))
+    return evidence, logs
+
+
 async def fetch_google_patents(client: httpx.AsyncClient, metadata: PaperMetadata) -> tuple[list[EvidenceItem], list[TraceLog]]:
     logs = [log("Patents", "Searching Google Patents via XHR API")]
     title = metadata.title.strip()
@@ -379,7 +1031,7 @@ def synthesize(
     evidence: list[EvidenceItem],
     topics: list[str],
     rag_contexts: list[str],
-) -> tuple[str, list[ImpactSection], float, list[str], list[TraceLog], str, str]:
+) -> tuple[str, list[ImpactSection], float, list[str], list[TraceLog], str, str, dict]:
     logs = [log("Synthesis", "Generating evidence-grounded summary")]
     title = metadata.title
     year = metadata.year or "unknown year"
@@ -398,10 +1050,32 @@ def synthesize(
     hf_summary, model_provider, hf_logs = hf_synthesizer.generate(metadata, citation_count, evidence, topics, rag_contexts)
     logs.extend(hf_logs)
 
+    patent_ev  = [e for e in evidence if e.kind == "patent"]
+    code_ev    = [e for e in evidence if e.kind == "code"]
+    topic_str  = ", ".join(topics[:3]) if topics else "multiple research areas"
+
+    adoption = ""
+    if patent_ev:
+        adoption = (
+            f" Notably, the methodology has been cited in {len(patent_ev)} patent filing(s), "
+            f"indicating measurable translation into applied technology."
+        )
+    elif code_ev:
+        adoption = (
+            f" Open-source implementations were identified on GitHub, "
+            f"demonstrating active practical adoption beyond the academic community."
+        )
+    else:
+        adoption = (
+            f" The work's influence spans {topic_str}, "
+            f"reflecting broad interdisciplinary reach across the research community."
+        )
+
     deterministic_summary = (
-        f"{title} ({year}) by {authors} appears to have influenced later research through {citation_phrase}. "
-        f"The strongest available evidence comes from retrieved citation records and metadata, which indicate downstream use, comparison, or extension of the work. "
-        f"{evidence_sentence} The system has preserved source links so each claim can be checked before academic use."
+        f"{title} ({year}) by {authors} has accumulated **{citation_phrase}**, "
+        f"establishing it as a highly cited and influential contribution to its field. "
+        f"{evidence_sentence} "
+        f"Retrieved evidence confirms downstream engagement through citation networks and metadata records.{adoption}"
     )
     summary = hf_summary or deterministic_summary
 
@@ -439,17 +1113,23 @@ def synthesize(
         faithfulness = slm_faithfulness
     else:
         faithfulness = score_faithfulness(summary, evidence, rag_contexts, citation_count, topics)
-        
+
+    # ── Second-pass cross-validation (independent peer-reviewer) ──
+    validation_report, val_logs = hf_synthesizer.cross_validate_summary(
+        summary, evidence, citation_count, metadata
+    )
+    logs.extend(val_logs)
+
     guardrail_status = "passed" if faithfulness >= 0.75 else "review"
     limitations = []
     if not evidence:
         limitations.append("No citation evidence was retrieved from the available public APIs for this query.")
     if model_provider == "deterministic":
         limitations.append("AI narrative unavailable. Add GOOGLE_API_KEY to backend/.env for Gemini-powered summaries.")
-        
+
     logs.append(log("Guardrail", "Faithfulness guardrail evaluated summary", faithfulness_score=faithfulness, status=guardrail_status))
     logs.append(log("Synthesis", "Summary generated", faithfulness_score=faithfulness, model_provider=model_provider))
-    return summary, sections, faithfulness, limitations, logs, model_provider, guardrail_status
+    return summary, sections, faithfulness, limitations, logs, model_provider, guardrail_status, validation_report
 
 
 def score_faithfulness(summary: str, evidence: list[EvidenceItem], rag_contexts: list[str], citation_count: int, topics: list[str]) -> float:
@@ -481,6 +1161,7 @@ class AnalysisState(TypedDict, total=False):
     model_provider: str
     guardrail_status: str
     ref_report: str
+    validation_report: dict
 
 
 def initial_statuses() -> list[AgentStatus]:
@@ -520,17 +1201,35 @@ async def retrieval_node(state: AnalysisState) -> AnalysisState:
     statuses[2] = status("content", "Content", AgentState.running, "Finding full text and topics")
     statuses[3] = status("code", "Code", AgentState.running, "Searching repositories")
     async with httpx.AsyncClient(headers={"User-Agent": "ResearchImpactSummariser/0.1 (mailto:student@example.com)"}) as client:
-        scholar_task = fetch_semantic_scholar(client, metadata, normalized)
-        fallback_task = fetch_openalex_fallback(client, metadata.title)
-        enrichment_task = fetch_openalex_enrichment(client, metadata)
-        github_task = fetch_github_adoption(client, metadata)
-        patent_task = fetch_google_patents(client, metadata)
-        (citation_count, scholar_evidence, scholar_logs), (fallback_count, fallback_evidence, fallback_logs), (content_evidence, topics, content_logs), (code_evidence, code_logs), (patent_evidence, patent_logs) = await asyncio.gather(
-            scholar_task, fallback_task, enrichment_task, github_task, patent_task
+        scholar_task       = fetch_semantic_scholar(client, metadata, normalized)
+        fallback_task      = fetch_openalex_fallback(client, metadata.title)
+        enrichment_task    = fetch_openalex_enrichment(client, metadata)
+        github_task        = fetch_github_adoption(client, metadata)
+        patent_task        = fetch_google_patents(client, metadata)
+        pubmed_task        = fetch_pubmed(client, metadata)
+        clinical_task      = fetch_clinical_trials(client, metadata)
+        softsci_task       = fetch_soft_sciences(client, metadata)
+        (
+            (citation_count, scholar_evidence, scholar_logs),
+            (fallback_count, fallback_evidence, fallback_logs),
+            (content_evidence, topics, content_logs),
+            (code_evidence, code_logs),
+            (patent_evidence, patent_logs),
+            (pubmed_evidence, pubmed_logs),
+            (clinical_evidence, clinical_logs),
+            (softsci_evidence, softsci_logs),
+        ) = await asyncio.gather(
+            scholar_task, fallback_task, enrichment_task,
+            github_task, patent_task, pubmed_task, clinical_task, softsci_task,
         )
     citation_count = citation_count or fallback_count
-    logs.extend(scholar_logs + fallback_logs + content_logs + code_logs + patent_logs)
-    evidence = dedupe_evidence(scholar_evidence + fallback_evidence + content_evidence + code_evidence + patent_evidence)
+    logs.extend(scholar_logs + fallback_logs + content_logs + code_logs
+                + patent_logs + pubmed_logs + clinical_logs + softsci_logs)
+    evidence = dedupe_evidence(
+        scholar_evidence + fallback_evidence + content_evidence
+        + code_evidence + patent_evidence + pubmed_evidence
+        + clinical_evidence + softsci_evidence
+    )
     statuses[1] = status("scholar", "Scholar", AgentState.complete if evidence else AgentState.warning, f"{len(evidence)} evidence items retrieved")
     statuses[2] = status("content", "Content", AgentState.complete if content_evidence or topics else AgentState.warning, f"{len(topics)} topics, {len(content_evidence)} links")
     statuses[3] = status("code", "Code", AgentState.complete if code_evidence else AgentState.warning, f"{len(code_evidence)} repository leads")
@@ -552,7 +1251,7 @@ async def synthesis_node(state: AnalysisState) -> AnalysisState:
     logs = state["logs"]
     statuses = state["statuses"]
     statuses[6] = status("synthesis", "Synthesis", AgentState.running, "Synthesizing summary")
-    summary, sections, faithfulness, limitations, synth_logs, model_provider, guardrail_status = await asyncio.to_thread(
+    summary, sections, faithfulness, limitations, synth_logs, model_provider, guardrail_status, validation_report = await asyncio.to_thread(
         synthesize,
         state["metadata"],
         state["citation_count"],
@@ -573,6 +1272,7 @@ async def synthesis_node(state: AnalysisState) -> AnalysisState:
         "statuses": statuses,
         "model_provider": model_provider,
         "guardrail_status": guardrail_status,
+        "validation_report": validation_report,
     }
 
 
@@ -591,32 +1291,10 @@ async def ref_node(state: AnalysisState) -> AnalysisState:
     )
     logs.extend(ref_logs)
     
-    # Fallback to deterministic template if HF fails or is disabled
+    # Fallback: reuse the impact summary as the REF paragraph
     if not hf_report:
-        title = state["metadata"].title
-        authors = ", ".join(state["metadata"].authors) if state["metadata"].authors else "Unknown authors"
-        year = state["metadata"].year or "Unknown year"
-        citation_phrase = f"{state['citation_count']} citations" if state["citation_count"] else "limited citation data"
-        
-        evidence_list = "\n".join(f"- **{item.kind.title()}**: {item.title} ({item.source})" for item in state["evidence"][:5])
-        if not evidence_list:
-            evidence_list = "- No robust downstream evidence retrieved yet."
-            
-        hf_report = f"""### 1. Summary of Impact
-The research titled "{title}" ({year}) has demonstrated clear downstream impact, primarily evidenced through its {citation_phrase}.
-
-### 2. Underpinning Research
-This research was conducted by {authors}. The system retrieved metadata and citation records confirming its status as a foundational or actively cited work within its domain.
-
-### 3. Details of Impact
-The impact of this work spans several domains, evidenced by the following adoption signals:
-{evidence_list}
-
-### 4. References to the Research
-- CrossRef DOI: {state["metadata"].doi or "N/A"}
-- {state["citation_count"]} downstream citations identified via Semantic Scholar and OpenAlex.
-"""
-        logs.append(log("REF", "Generated deterministic REF report template fallback"))
+        hf_report = state["summary"]
+        logs.append(log("REF", "Using impact summary as REF paragraph (Gemini unavailable)"))
 
     statuses[7] = status("ref", "REF Report", AgentState.complete, "Report generated")
     return {**state, "ref_report": hf_report, "statuses": statuses, "logs": logs}
@@ -657,6 +1335,7 @@ async def analyze_paper(query: str):
             "guardrail_status": "not_run",
             "limitations": [],
             "ref_report": "",
+            "validation_report": {},
         }
     )
     return {
@@ -674,6 +1353,7 @@ async def analyze_paper(query: str):
         "guardrail_status": state["guardrail_status"],
         "limitations": state["limitations"],
         "ref_report": state.get("ref_report", ""),
+        "validation_report": state.get("validation_report", {}),
     }
 
 

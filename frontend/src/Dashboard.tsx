@@ -80,6 +80,19 @@ type AccessCheck = {
   reason: string;
 };
 
+type ValidationReport = {
+  accuracy?: number;
+  accuracy_reason?: string;
+  completeness?: number;
+  completeness_reason?: string;
+  conciseness?: number;
+  conciseness_reason?: string;
+  word_count_score?: number;
+  word_count_reason?: string;
+  overall_score?: number;
+  feedback?: string;
+};
+
 type AnalyzeResponse = {
   metadata: PaperMetadata;
   summary: string;
@@ -95,6 +108,7 @@ type AnalyzeResponse = {
   guardrail_status: string;
   limitations: string[];
   ref_report: string;
+  validation_report?: ValidationReport;
   access?: AccessCheck;
 };
 
@@ -112,24 +126,34 @@ type SearchCandidate = {
   venue: string;
   type: string;
   url: string | null;
+  citation_count?: number;
+  is_top_impact?: boolean;
 };
 
 type EvalSide = {
   approach: string;
+  label?: string;
   summary: string;
-  citation_count: number;
+  citation_count?: number;
   evidence_count: number;
   sources_used: string[];
   word_count: number;
   faithfulness_score: number;
-  elapsed_seconds: number | null;
+  elapsed_seconds?: number | null;
   rag_contexts?: number;
 };
 
 type EvalComparison = {
   query: string;
   agentic: EvalSide;
-  baseline: EvalSide;
+  // New three-way shape:
+  baseline_a?: EvalSide;        // CrossRef-only (no RAG)
+  baseline_b?: EvalSide;        // Naive multi-source RAG
+  agentic_faithfulness?: number;
+  baseline_a_faithfulness?: number;
+  baseline_b_faithfulness?: number;
+  // Legacy single-baseline shape (back-compat):
+  baseline?: EvalSide;
   verdict: string;
   agentic_full?: AnalyzeResponse;
 };
@@ -200,6 +224,20 @@ const EVIDENCE_FILTERS = [
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/** Render **bold** markdown spans inside a string as <strong> elements. */
+function BoldText({ text }: { text: string }) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return (
+    <>
+      {parts.map((part, i) =>
+        part.startsWith("**") && part.endsWith("**")
+          ? <strong key={i}>{part.slice(2, -2)}</strong>
+          : <span key={i}>{part}</span>
+      )}
+    </>
+  );
+}
+
 function formatAuthors(authors: string[]): string {
   if (!authors || !authors.length) return "Unknown authors";
   if (authors.length <= 3) return authors.join(", ");
@@ -237,6 +275,19 @@ function stepClass(state: AgentState): string {
   return `agent-step ${state}`;
 }
 
+/** Convert **bold** and *italic* markdown within a line to JSX. */
+function inlineMarkdown(line: string, key: number): React.ReactNode {
+  // Split on **bold** and *italic* patterns
+  const parts = line.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
+  return parts.map((part, j) => {
+    if (part.startsWith("**") && part.endsWith("**"))
+      return <strong key={j}>{part.slice(2, -2)}</strong>;
+    if (part.startsWith("*") && part.endsWith("*"))
+      return <em key={j}>{part.slice(1, -1)}</em>;
+    return part;
+  });
+}
+
 function renderMarkdown(text: string): React.ReactNode {
   if (!text) return null;
   const lines = text.split("\n");
@@ -244,11 +295,19 @@ function renderMarkdown(text: string): React.ReactNode {
     if (line.startsWith("### ")) return <h3 key={i} className="ref-section-title">{line.replace(/^###\s*/, "")}</h3>;
     if (line.startsWith("## "))  return <h2 key={i} className="ref-section-title">{line.replace(/^##\s*/, "")}</h2>;
     if (line.startsWith("# "))   return <h2 key={i} className="ref-section-title">{line.replace(/^#\s*/, "")}</h2>;
-    if (line.startsWith("- ") || line.startsWith("* ")) return <p key={i} className="ref-list-item">{line.replace(/^[-*]\s*/, "• ")}</p>;
-    if (/^\d+\.\s/.test(line)) return <p key={i} className="ref-list-item">{line}</p>;
+    if (line.startsWith("- ") || line.startsWith("* "))
+      return <p key={i} className="ref-list-item">• {inlineMarkdown(line.replace(/^[-*]\s*/, ""), i)}</p>;
+    if (/^\d+\.\s/.test(line))
+      return <p key={i} className="ref-list-item">{inlineMarkdown(line, i)}</p>;
     if (!line.trim()) return <br key={i} />;
-    return <p key={i} className="ref-paragraph">{line}</p>;
+    return <p key={i} className="ref-paragraph">{inlineMarkdown(line, i)}</p>;
   });
+}
+
+function applyInlineHtml(line: string): string {
+  return line
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g,     "<em>$1</em>");
 }
 
 function downloadReport(content: string, filename: string) {
@@ -256,12 +315,12 @@ function downloadReport(content: string, filename: string) {
 <head><meta charset='utf-8'><title>REF Impact Case Study</title></head>
 <body style='font-family:Calibri,sans-serif;font-size:11pt;line-height:1.6'>
 ${content.split("\n").map(line => {
-  if (line.startsWith("### ")) return `<h3 style='color:#4F46E5'>${line.replace(/^###\s*/,"")}</h3>`;
-  if (line.startsWith("## "))  return `<h2>${line.replace(/^##\s*/,"")}</h2>`;
-  if (line.startsWith("- ") || line.startsWith("* ")) return `<p style='margin-left:20px'>• ${line.replace(/^[-*]\s*/,"")}</p>`;
-  if (/^\d+\.\s/.test(line)) return `<p style='margin-left:20px'>${line}</p>`;
+  if (line.startsWith("### ")) return `<h3 style='color:#4F46E5'>${applyInlineHtml(line.replace(/^###\s*/,""))}</h3>`;
+  if (line.startsWith("## "))  return `<h2>${applyInlineHtml(line.replace(/^##\s*/,""))}</h2>`;
+  if (line.startsWith("- ") || line.startsWith("* ")) return `<p style='margin-left:20px'>• ${applyInlineHtml(line.replace(/^[-*]\s*/,""))}</p>`;
+  if (/^\d+\.\s/.test(line)) return `<p style='margin-left:20px'>${applyInlineHtml(line)}</p>`;
   if (!line.trim()) return "<br/>";
-  return `<p>${line}</p>`;
+  return `<p>${applyInlineHtml(line)}</p>`;
 }).join("")}
 </body></html>`;
   const blob = new Blob([htmlContent], { type: "application/msword" });
@@ -345,6 +404,62 @@ function AuthorBadge({ access }: { access: AccessCheck }) {
   );
 }
 
+// ─── Peer-Review Scorecard ───────────────────────────────────────────────────
+function PeerReviewCard({ report }: { report: ValidationReport }) {
+  const dims: { key: keyof ValidationReport; label: string; reasonKey: keyof ValidationReport }[] = [
+    { key: "accuracy",        label: "Accuracy",         reasonKey: "accuracy_reason" },
+    { key: "completeness",    label: "Completeness",     reasonKey: "completeness_reason" },
+    { key: "conciseness",     label: "Conciseness",      reasonKey: "conciseness_reason" },
+    { key: "word_count_score",label: "Word Count",       reasonKey: "word_count_reason" },
+  ];
+
+  const scoreColor = (v?: number) => {
+    if (v == null) return "#94a3b8";
+    if (v >= 8) return "#22c55e";
+    if (v >= 6) return "#f59e0b";
+    return "#ef4444";
+  };
+
+  const hasAny = dims.some(d => report[d.key] != null);
+  if (!hasAny) return null;
+
+  return (
+    <div className="peer-review-card">
+      <div className="peer-review-header">
+        <BrainCircuit size={15} />
+        <span>AI Peer Review</span>
+        {report.overall_score != null && (
+          <span className="peer-overall" style={{ color: scoreColor(report.overall_score) }}>
+            {report.overall_score}/10
+          </span>
+        )}
+      </div>
+      <div className="peer-dims">
+        {dims.map(d => {
+          const val = report[d.key] as number | undefined;
+          const reason = report[d.reasonKey] as string | undefined;
+          if (val == null) return null;
+          return (
+            <div key={d.key} className="peer-dim-row" title={reason ?? ""}>
+              <span className="peer-dim-label">{d.label}</span>
+              <div className="peer-bar-track">
+                <div
+                  className="peer-bar-fill"
+                  style={{ width: `${val * 10}%`, background: scoreColor(val) }}
+                />
+              </div>
+              <span className="peer-dim-score" style={{ color: scoreColor(val) }}>{val}</span>
+            </div>
+          );
+        })}
+      </div>
+      {report.feedback && (
+        <p className="peer-feedback">"{report.feedback}"</p>
+      )}
+    </div>
+  );
+}
+
 function OverviewTab({
   result, loading, openSections, setOpenSections,
 }: {
@@ -379,6 +494,27 @@ function OverviewTab({
                 <> · <a href={`https://doi.org/${result.metadata.doi}`} target="_blank" rel="noreferrer" className="doi-link">{result.metadata.doi}</a></>
               ) : null}
             </p>
+            {/* Resolved-paper confirmation banner — prevents confusion when
+                multiple papers share a title (e.g. republications) */}
+            <div className="resolved-banner">
+              <Check size={13} className="resolved-icon" />
+              <span className="resolved-label">
+                Analysing highest-impact match:&nbsp;
+                <strong>{result.metadata.title}</strong>
+                {result.metadata.year ? ` (${result.metadata.year})` : ""}
+                {result.citation_count > 0
+                  ? ` · ${result.citation_count.toLocaleString()} citations`
+                  : ""}
+                {result.metadata.doi ? (
+                  <> · <a
+                    href={`https://doi.org/${result.metadata.doi}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="resolved-doi"
+                  >{result.metadata.doi}</a></>
+                ) : " · no DOI (arXiv preprint)"}
+              </span>
+            </div>
           </div>
           <div className={`faith-chip ${scoreClass(result.faithfulness_score)}`}>
             <span className="faith-score">{result.faithfulness_score.toFixed(2)}</span>
@@ -389,8 +525,12 @@ function OverviewTab({
         {result.access && <AuthorBadge access={result.access} />}
 
         <div className="summary-block">
-          <p className="summary-text">{result.summary}</p>
+          <p className="summary-text"><BoldText text={result.summary} /></p>
         </div>
+
+        {result.validation_report && Object.keys(result.validation_report).length > 0 && (
+          <PeerReviewCard report={result.validation_report} />
+        )}
 
         {result.topics && result.topics.length > 0 && (
           <div className="topics-row">
@@ -587,17 +727,17 @@ function RefReportTab({ refReport, doi }: { refReport: string; doi: string | nul
     <div className="ref-tab">
       <div className="ref-tab-header">
         <div>
-          <h3>REF Impact Case Study</h3>
-          <p className="ref-tab-sub">{wordCount.toLocaleString()} words · Research England format</p>
+          <h3>REF Impact Paragraph</h3>
+          <p className="ref-tab-sub">{wordCount} words · copy-paste ready</p>
         </div>
         <button
           className="btn-primary"
-          onClick={() => downloadReport(refReport, `REF_Case_Study_${(doi || "report").replace(/\//g,"_")}.doc`)}
+          onClick={() => downloadReport(refReport, `REF_Impact_${(doi || "report").replace(/\//g,"_")}.doc`)}
         >
           <Download size={14} /> Download .doc
         </button>
       </div>
-      <div className="ref-body">
+      <div className="ref-body ref-body-single">
         {renderMarkdown(refReport)}
       </div>
     </div>
@@ -670,12 +810,24 @@ function EvalTab({ result, loading, error }: {
   }
 
   const ag = result.agentic;
-  const bl = result.baseline;
-  const agWins = ag.faithfulness_score >= bl.faithfulness_score;
+  // Support both the new three-way shape and the legacy single-baseline shape.
+  const naive = result.baseline_b ?? null;                         // Naive multi-source RAG
+  const cross = result.baseline_a ?? result.baseline ?? null;      // CrossRef-only
+  const fmt = (n: number | undefined | null) =>
+    typeof n === "number" ? n.toFixed(2) : "—";
+
+  // Columns to render (skip any baseline the backend didn't return)
+  const cols: { key: string; label: string; side: EvalSide | null }[] = [
+    { key: "ag",    label: ag.label ?? "Veritrace (semantic RAG)", side: ag },
+    { key: "naive", label: naive?.label ?? "Naive multi-source RAG", side: naive },
+    { key: "cross", label: cross?.label ?? "CrossRef-only (no RAG)", side: cross },
+  ].filter(c => c.side);
+
+  const bestFaith = Math.max(...cols.map(c => c.side!.faithfulness_score ?? 0));
 
   return (
     <div className="eval-tab">
-      <div className={`verdict-banner ${agWins ? "agentic-wins" : "baseline-wins"}`}>
+      <div className="verdict-banner agentic-wins">
         <BrainCircuit size={16} />
         <strong>Verdict:</strong> {result.verdict}
       </div>
@@ -685,66 +837,63 @@ function EvalTab({ result, loading, error }: {
           <thead>
             <tr>
               <th>Metric</th>
-              <th>Agentic Pipeline</th>
-              <th>Baseline (CrossRef only)</th>
+              {cols.map(c => <th key={c.key}>{c.label}</th>)}
             </tr>
           </thead>
           <tbody>
             <tr>
               <td>Faithfulness score</td>
-              <td>
-                <span className={`eval-score-pill ${ag.faithfulness_score >= bl.faithfulness_score ? "winner" : ""}`}>
-                  {ag.faithfulness_score.toFixed(2)}
-                </span>
-              </td>
-              <td>
-                <span className={`eval-score-pill ${bl.faithfulness_score > ag.faithfulness_score ? "winner" : ""}`}>
-                  {bl.faithfulness_score.toFixed(2)}
-                </span>
-              </td>
+              {cols.map(c => (
+                <td key={c.key}>
+                  <span className={`eval-score-pill ${(c.side!.faithfulness_score ?? 0) >= bestFaith ? "winner" : ""}`}>
+                    {fmt(c.side!.faithfulness_score)}
+                  </span>
+                </td>
+              ))}
             </tr>
             <tr>
               <td>Evidence items</td>
-              <td><strong>{ag.evidence_count}</strong></td>
-              <td>{bl.evidence_count}</td>
+              {cols.map(c => <td key={c.key}>{c.side!.evidence_count ?? 0}</td>)}
             </tr>
             <tr>
               <td>Sources used</td>
-              <td>{ag.sources_used.join(", ") || "—"}</td>
-              <td>{bl.sources_used?.join(", ") || "—"}</td>
+              {cols.map(c => <td key={c.key}>{c.side!.sources_used?.join(", ") || "—"}</td>)}
             </tr>
             <tr>
               <td>Summary length</td>
-              <td>{ag.word_count} words</td>
-              <td>{bl.word_count} words</td>
+              {cols.map(c => <td key={c.key}>{c.side!.word_count ?? 0} words</td>)}
             </tr>
             <tr>
               <td>RAG contexts</td>
-              <td>{ag.rag_contexts ?? "—"}</td>
-              <td>0</td>
+              {cols.map(c => (
+                <td key={c.key}>
+                  {c.key === "ag" ? (c.side!.rag_contexts ?? "—")
+                    : c.key === "naive" ? "keyword"
+                    : "0"}
+                </td>
+              ))}
             </tr>
             <tr>
               <td>Elapsed</td>
-              <td>{ag.elapsed_seconds != null ? `${ag.elapsed_seconds}s` : "—"}</td>
-              <td>{bl.elapsed_seconds != null ? `${bl.elapsed_seconds}s` : "—"}</td>
+              {cols.map(c => (
+                <td key={c.key}>
+                  {c.side!.elapsed_seconds != null ? `${c.side!.elapsed_seconds}s` : "—"}
+                </td>
+              ))}
             </tr>
           </tbody>
         </table>
       </div>
 
       <div className="eval-summaries">
-        <div className="eval-summary-card">
-          <div className="eval-summary-head">
-            <BrainCircuit size={14} /> Agentic summary
+        {cols.map(c => (
+          <div key={c.key} className={`eval-summary-card${c.key === "ag" ? "" : " baseline"}`}>
+            <div className="eval-summary-head">
+              {c.key === "ag" ? <BrainCircuit size={14} /> : <Globe size={14} />} {c.label}
+            </div>
+            <p>{c.side!.summary}</p>
           </div>
-          <p>{ag.summary}</p>
-        </div>
-        <div className="eval-summary-card baseline">
-          <div className="eval-summary-head">
-            <Globe size={14} /> Baseline summary
-          </div>
-          <p>{bl.summary}</p>
-        </div>
+        ))}
       </div>
     </div>
   );
@@ -1253,17 +1402,7 @@ export default function Dashboard() {
                 {evalLoading ? <Loader2 size={14} className="spin" /> : <BrainCircuit size={14} />}
                 {evalResult ? "Re-evaluate" : "Run Evaluation"}
               </button>
-              <button
-                type="button"
-                className="btn btn-primary"
-                style={{ background: "var(--indigo-800)", borderColor: "var(--indigo-800)" }}
-                disabled={!result || betaLoading}
-                onClick={runBetaRef}
-                title="Generate REF 2029 Beta case study"
-              >
-                {betaLoading ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}
-                Beta REF
-              </button>
+              {/* Beta REF removed – not required */}
             </div>
           </div>
           <div className="quick-pills">
@@ -1306,14 +1445,7 @@ export default function Dashboard() {
                   ? <span className="tab-count active-count">vs</span>
                   : null}
             </button>
-            <button className={`tab-btn ${activeTab === "betaref" ? "active" : ""}`} onClick={() => setActiveTab("betaref")}>
-              Beta REF
-              {betaRef && !betaError
-                ? <span className="tab-count active-count">✓</span>
-                : betaLoading
-                  ? <Loader2 size={11} className="spin" style={{ marginLeft: 4 }} />
-                  : null}
-            </button>
+              {/* Beta REF tab removed */}
           </nav>
         )}
 
@@ -1330,11 +1462,30 @@ export default function Dashboard() {
           <div className="candidate-picker-overlay" onClick={e => e.target === e.currentTarget && setCandidates([])}>
             <div className="candidate-picker-sheet">
               <div className="candidate-picker-title">Multiple papers found — select one to analyse</div>
+              <div className="candidate-picker-sub">Ranked by citation impact — the highest-impact version is highlighted.</div>
               {candidates.map((c, i) => (
-                <div key={i} className="candidate-item" onClick={() => { setCandidates([]); runAnalyze(c.doi ?? c.title); }}>
-                  <div className="candidate-title">{c.title}</div>
-                  <div className="candidate-authors">{formatAuthors(c.authors)}{c.year ? ` · ${c.year}` : ""}{c.venue ? ` · ${c.venue}` : ""}</div>
-                  {c.doi && <div className="candidate-doi">{c.doi}</div>}
+                <div
+                  key={i}
+                  className={`candidate-item${c.is_top_impact ? " candidate-item-top" : ""}`}
+                  onClick={() => { setCandidates([]); runAnalyze(c.doi ?? c.title); }}
+                >
+                  <div className="candidate-row">
+                    <div className="candidate-title">{c.title}</div>
+                    {c.is_top_impact && (
+                      <span className="candidate-badge">★ Highest impact</span>
+                    )}
+                  </div>
+                  <div className="candidate-authors">
+                    {formatAuthors(c.authors)}{c.year ? ` · ${c.year}` : ""}{c.venue ? ` · ${c.venue}` : ""}
+                  </div>
+                  <div className="candidate-meta-row">
+                    {typeof c.citation_count === "number" && (
+                      <span className={`candidate-cites${c.is_top_impact ? " candidate-cites-top" : ""}`}>
+                        {c.citation_count.toLocaleString()} citations
+                      </span>
+                    )}
+                    {c.doi && <span className="candidate-doi">{c.doi}</span>}
+                  </div>
                 </div>
               ))}
             </div>
@@ -1355,7 +1506,7 @@ export default function Dashboard() {
             <div className="empty-state">
               <BookOpen size={40} className="empty-icon" />
               <div className="empty-title">Paste a DOI to begin</div>
-              <div className="empty-body">The agent will retrieve metadata, citations, code, patents, and funding signals, then synthesise an auditable 200-word impact summary.</div>
+              <div className="empty-body">The agent will retrieve metadata, citations, code, patents, and funding signals, then synthesise a concise 100-word impact summary validated by an independent AI peer-reviewer.</div>
             </div>
           )}
 
@@ -1398,14 +1549,7 @@ export default function Dashboard() {
             <EvalTab result={evalResult} loading={evalLoading} error={evalError} />
           )}
 
-          {activeTab === "betaref" && (
-            <BetaRefTab
-              result={betaRef}
-              loading={betaLoading}
-              error={betaError}
-              onRun={runBetaRef}
-            />
-          )}
+          {/* betaref tab removed */}
         </div>
       </section>
     </main>

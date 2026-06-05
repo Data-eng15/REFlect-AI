@@ -15,7 +15,7 @@ from pydantic import BaseModel, field_validator
 
 from .auth import create_linkedin_token, get_current_uid, get_current_user
 from .access_guard import DEMO_MODE, check_author_access
-from .database import get_dataset_rows, get_evaluations, get_stats, get_user_history, init_db, save_analysis, save_evaluation
+from .database import get_calibration_report, get_dataset_rows, get_evaluations, get_stats, get_user_history, init_db, save_analysis, save_calibration, save_evaluation
 from .evaluation import run_comparison
 from .models import AnalyzeRequest, AnalyzeResponse
 from .ref_beta import run_beta_ref
@@ -62,7 +62,137 @@ def _crossref_candidate(work: dict) -> dict:
     year = None
     if "published-print" in work: year = work["published-print"].get("date-parts",[[None]])[0][0]
     elif "published-online" in work: year = work["published-online"].get("date-parts",[[None]])[0][0]
-    return {"doi":work.get("DOI"),"title":title,"authors":authors,"year":year,"venue":venue,"type":work.get("type",""),"url":work.get("URL")}
+    return {"doi":work.get("DOI"),"title":title,"authors":authors,"year":year,"venue":venue,
+            "type":work.get("type",""),"url":work.get("URL"),
+            "citation_count":work.get("is-referenced-by-count",0) or 0}
+
+
+def _norm_title(t: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+
+# Predatory / junk republication DOI prefixes. These registrants mass-republish
+# existing papers under new DOIs with inflated metadata, polluting title search.
+_JUNK_DOI_PREFIXES = ("10.65215/",)
+
+def _is_junk_doi(doi: str | None) -> bool:
+    if not doi:
+        return False
+    d = doi.lower().replace("https://doi.org/", "")
+    return any(d.startswith(p) for p in _JUNK_DOI_PREFIXES)
+
+
+async def _candidates_semantic_scholar(client: httpx.AsyncClient, q: str) -> list[dict]:
+    """Semantic Scholar candidates — the only reliable source for canonical
+    high-impact papers (e.g. the original 2017 'Attention Is All You Need').
+    Uses autocomplete + batch fetch, each retried once on rate-limit, so a
+    transient 429 doesn't silently drop the field-defining paper."""
+    import asyncio as _aio
+    out: list[dict] = []
+    key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+    headers = {"x-api-key": key} if key else {}
+
+    async def _get_with_retry(url, **kw):
+        for attempt in range(2):
+            try:
+                r = await client.get(url, headers=headers, timeout=10, **kw)
+                if r.status_code == 429 and attempt == 0:
+                    await _aio.sleep(1.5)
+                    continue
+                return r
+            except Exception:
+                if attempt == 0:
+                    await _aio.sleep(1.0)
+                    continue
+                return None
+        return None
+
+    async def _post_with_retry(url, **kw):
+        for attempt in range(2):
+            try:
+                r = await client.post(url, headers=headers, timeout=15, **kw)
+                if r.status_code == 429 and attempt == 0:
+                    await _aio.sleep(1.5)
+                    continue
+                return r
+            except Exception:
+                if attempt == 0:
+                    await _aio.sleep(1.0)
+                    continue
+                return None
+        return None
+
+    # 1. autocomplete -> ranked paper IDs
+    ac = await _get_with_retry(
+        "https://api.semanticscholar.org/graph/v1/paper/autocomplete",
+        params={"query": q})
+    ids = [m["id"] for m in ac.json().get("matches", [])[:8] if m.get("id")] if (ac and ac.is_success) else []
+    if not ids:
+        return out
+
+    # 2. batch fetch ALL details in a single request
+    r = await _post_with_retry(
+        "https://api.semanticscholar.org/graph/v1/paper/batch",
+        params={"fields": "title,year,authors,externalIds,citationCount,venue"},
+        json={"ids": ids})
+    if not r or not r.is_success:
+        return out
+    for p in r.json():
+        if not p:
+            continue
+        ext = p.get("externalIds") or {}
+        doi = ext.get("DOI") or (f"10.48550/arXiv.{ext['ArXiv']}" if ext.get("ArXiv") else None)
+        if _is_junk_doi(doi):
+            continue
+        out.append({
+            "doi": doi,
+            "title": p.get("title", "Unknown"),
+            "authors": [a.get("name", "") for a in (p.get("authors") or [])[:5]],
+            "year": p.get("year"),
+            "venue": p.get("venue", "") or "",
+            "type": "paper",
+            "url": f"https://doi.org/{doi}" if doi else None,
+            "citation_count": p.get("citationCount") or 0,
+        })
+    return out
+
+
+async def _candidates_openalex(client: httpx.AsyncClient, q: str) -> list[dict]:
+    """OpenAlex title search ranked by citation count."""
+    out: list[dict] = []
+    try:
+        r = await client.get("https://api.openalex.org/works",
+                             params={"filter": f"title.search:{q}",
+                                     "sort": "cited_by_count:desc", "per-page": 6,
+                                     "select": "title,doi,publication_year,cited_by_count,authorships,primary_location"},
+                             timeout=12)
+        if not r.is_success:
+            return out
+        for w in r.json().get("results", [])[:8]:
+            doi_raw = (w.get("doi") or "")
+            doi = doi_raw.replace("https://doi.org/", "") if doi_raw else None
+            if _is_junk_doi(doi):
+                continue
+            loc = (w.get("primary_location") or {}).get("source") or {}
+            out.append({
+                "doi": doi,
+                "title": w.get("title", "Unknown"),
+                "authors": [a.get("author", {}).get("display_name", "")
+                            for a in (w.get("authorships") or [])[:5]],
+                "year": w.get("publication_year"),
+                "venue": loc.get("display_name", "") or "",
+                "type": "paper",
+                "url": f"https://doi.org/{doi}" if doi else None,
+                "citation_count": w.get("cited_by_count") or 0,
+            })
+    except Exception:
+        pass
+    return out
+
+
+_search_cache: dict[str, tuple[float, dict]] = {}
+_SEARCH_TTL = 600  # seconds
 
 @app.get("/api/search")
 async def search(request: Request, q: str = "") -> dict:
@@ -70,20 +200,80 @@ async def search(request: Request, q: str = "") -> dict:
     try: safe_q = validate_query(q)
     except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc))
     kind = classify_query(safe_q)
-    candidates = []
     from urllib.parse import quote
+    import asyncio as _aio
+
+    # Serve a recent cached result so retries stay stable and SS load is reduced.
+    cache_key = f"{kind}:{safe_q.lower().strip()}"
+    cached = _search_cache.get(cache_key)
+    if cached and (time.time() - cached[0]) < _SEARCH_TTL:
+        return cached[1]
+
     async with httpx.AsyncClient() as client:
-        if kind in ("doi","arxiv"):
+        # Direct DOI/arXiv lookup — single authoritative result
+        if kind in ("doi", "arxiv"):
             try:
                 r = await client.get(f"https://api.crossref.org/works/{quote(safe_q,safe='')}", timeout=12)
-                if r.is_success: candidates = [_crossref_candidate(r.json()["message"])]
-            except Exception: pass
-        else:
-            try:
-                r = await client.get("https://api.crossref.org/works", params={"query.title":safe_q,"rows":5}, timeout=12)
-                if r.is_success: candidates = [_crossref_candidate(w) for w in r.json().get("message",{}).get("items",[])]
-            except Exception: pass
-    return {"query":safe_q,"kind":kind,"candidates":candidates}
+                if r.is_success:
+                    return {"query": safe_q, "kind": kind,
+                            "candidates": [{**_crossref_candidate(r.json()["message"]), "is_top_impact": True}]}
+            except Exception:
+                pass
+            return {"query": safe_q, "kind": kind, "candidates": []}
+
+        # Title query — gather candidates from THREE sources concurrently,
+        # each carrying real citation counts so we can surface the
+        # industry-defining paper rather than recent republications.
+        ss, oa, cr = await _aio.gather(
+            _candidates_semantic_scholar(client, safe_q),
+            _candidates_openalex(client, safe_q),
+            _crossref_title(client, safe_q),
+        )
+
+    # Merge + dedupe by normalised title. For each title group keep the
+    # canonical version: highest citation count, tie-broken by EARLIEST year
+    # (the original 2017 paper beats a 2025 republication of the same title).
+    merged: dict[str, dict] = {}
+    for c in (ss + oa + cr):
+        if not c.get("title") or _is_junk_doi(c.get("doi")):
+            continue
+        key = _norm_title(c["title"])
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = c
+            continue
+        c_cites = c.get("citation_count") or 0
+        e_cites = existing.get("citation_count") or 0
+        if c_cites > e_cites:
+            merged[key] = c
+        elif c_cites == e_cites and (c.get("year") or 9999) < (existing.get("year") or 9999):
+            merged[key] = c
+
+    candidates = list(merged.values())
+    # Primary sort: citation count DESC (revolutionary paper first).
+    # Tie-break: older year first (the original precedes republications).
+    candidates.sort(key=lambda c: (-(c.get("citation_count") or 0), c.get("year") or 9999))
+    candidates = candidates[:6]
+    if candidates:
+        candidates[0]["is_top_impact"] = True  # highlight the highest-impact paper
+
+    result = {"query": safe_q, "kind": kind, "candidates": candidates}
+    # Cache only confident results (Semantic Scholar contributed canonical data).
+    # If SS failed entirely, skip caching so the next request retries it.
+    if ss and candidates:
+        _search_cache[cache_key] = (time.time(), result)
+    return result
+
+
+async def _crossref_title(client: httpx.AsyncClient, q: str) -> list[dict]:
+    try:
+        r = await client.get("https://api.crossref.org/works",
+                             params={"query.title": q, "rows": 5}, timeout=12)
+        if r.is_success:
+            return [_crossref_candidate(w) for w in r.json().get("message", {}).get("items", [])]
+    except Exception:
+        pass
+    return []
 
 @app.post("/api/analyze")
 async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_user: Optional[dict] = Depends(get_current_user)) -> dict:
@@ -137,6 +327,47 @@ async def evaluate(request: Request, body: AnalyzeRequest = Body(...), current_u
 async def evaluate_history(limit: int = 20) -> dict:
     rows = get_evaluations(limit=min(limit,50))
     return {"count":len(rows),"rows":rows}
+
+# ── Human-in-the-loop calibration ────────────────────────────────────────────
+
+class CalibrationRequest(BaseModel):
+    query: str
+    title: Optional[str] = None
+    reviewer: Optional[str] = None
+    ai_faithfulness: Optional[float] = None
+    human_faithfulness: Optional[float] = None
+    ai_accuracy: Optional[float] = None
+    human_accuracy: Optional[float] = None
+    ai_completeness: Optional[float] = None
+    human_completeness: Optional[float] = None
+    ai_conciseness: Optional[float] = None
+    human_conciseness: Optional[float] = None
+    ai_overall: Optional[float] = None
+    human_overall: Optional[float] = None
+    notes: Optional[str] = None
+
+    @field_validator("query")
+    @classmethod
+    def _q_len(cls, v: str) -> str:
+        if not v or len(v) > 500:
+            raise ValueError("Invalid query")
+        return v
+
+@app.post("/api/calibrate")
+async def calibrate(request: Request, body: CalibrationRequest = Body(...)) -> dict:
+    """Submit a paired AI-vs-human rating for a generated summary.
+    Builds the ground-truth dataset that quantifies how closely the AI judge
+    tracks trained human reviewers."""
+    rate_limit(request, limit=20, window=60)
+    row_id = save_calibration(body.model_dump())
+    report = get_calibration_report()
+    return {"saved_id": row_id, "report": report}
+
+@app.get("/api/calibration/report")
+async def calibration_report() -> dict:
+    """AI-vs-human agreement statistics: Pearson r, Spearman rho, and MAE
+    per scoring dimension across all collected calibration samples."""
+    return get_calibration_report()
 
 class BetaRefRequest(BaseModel):
     query: str; title: str; authors: list[str] = []; year: Optional[int] = None

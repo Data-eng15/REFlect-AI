@@ -15,29 +15,43 @@ EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-Min
 
 
 class EmbeddingProvider:
+    """Semantic embeddings via sentence-transformers MiniLM (primary).
+    Falls back to SHA-256 hash embeddings only if the library is missing."""
+
     def __init__(self) -> None:
         self.provider = "hash"
         self.dimension = 384
         self._model: Any | None = None
         self._load_error: str | None = None
+        # Eagerly attempt to load the model at startup so the first request
+        # isn't penalised by the download / initialisation latency.
+        self._try_load()
+
+    def _try_load(self) -> None:
+        if self._model is not None or self._load_error is not None:
+            return
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(EMBEDDING_MODEL)
+            self.provider = f"hf:{EMBEDDING_MODEL}"
+        except Exception as exc:
+            self._load_error = str(exc)
 
     def embed(self, texts: list[str]) -> tuple[list[list[float]], list[TraceLog]]:
         logs: list[TraceLog] = []
-        if self._model is None and self._load_error is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-
-                self._model = SentenceTransformer(EMBEDDING_MODEL)
-                self.provider = f"hf:{EMBEDDING_MODEL}"
-                logs.append(log("RAG", "Loaded Hugging Face embedding model", model=EMBEDDING_MODEL))
-            except Exception as exc:
-                self._load_error = str(exc)
-                logs.append(log("RAG", "HF embedding model unavailable; using local hash embeddings", error=str(exc)))
+        self._try_load()
 
         if self._model is not None:
             vectors = self._model.encode(texts, normalize_embeddings=True).tolist()
+            logs.append(log("RAG", "Semantic embeddings generated",
+                            model=EMBEDDING_MODEL, texts=len(texts)))
             return vectors, logs
 
+        # Fallback — log a warning so operators know semantic search is degraded
+        logs.append(log("RAG",
+                         "WARNING: using hash embeddings — semantic search degraded. "
+                         "Ensure sentence-transformers is installed.",
+                         error=self._load_error))
         return [hash_embedding(text, self.dimension) for text in texts], logs
 
 
