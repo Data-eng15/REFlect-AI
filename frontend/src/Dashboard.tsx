@@ -188,6 +188,11 @@ type BetaRefResult = {
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+// ngrok's free tier serves an HTML interstitial to browser requests unless this
+// header is present. Harmless against non-ngrok backends. Injected on every API call.
+const apiFetch = (input: string, init: RequestInit = {}) =>
+  fetch(input, { ...init, headers: { "ngrok-skip-browser-warning": "true", ...(init.headers || {}) } });
+
 const SAMPLE_QUERIES = [
   "10.1038/nature14539",
   "Attention Is All You Need",
@@ -1108,14 +1113,14 @@ export default function Dashboard() {
 
   // Load stats
   useEffect(() => {
-    fetch(`${API_URL}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
+    apiFetch(`${API_URL}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
   }, []);
 
   // Load user history from backend if logged in
   useEffect(() => {
     if (!user) return;
     user.getToken().then(token => {
-      fetch(`${API_URL}/api/history`, { headers: { Authorization: `Bearer ${token}` } })
+      apiFetch(`${API_URL}/api/history`, { headers: { Authorization: `Bearer ${token}` } })
         .then(r => r.ok ? r.json() : null)
         .then(data => { if (data?.queries) setHistory(data.queries.slice(0, 10)); })
         .catch(() => {});
@@ -1159,7 +1164,7 @@ export default function Dashboard() {
 
     try {
       const headers = { "Content-Type": "application/json", ...(await getAuthHeader()) };
-      const resp = await fetch(`${API_URL}/api/analyze`, {
+      const resp = await apiFetch(`${API_URL}/api/analyze`, {
         method: "POST", headers, body: JSON.stringify({ query: resolvedQuery }),
       });
       if (!resp.ok) {
@@ -1193,7 +1198,7 @@ export default function Dashboard() {
     // Title → search first
     setSearchLoading(true);
     try {
-      const resp = await fetch(`${API_URL}/api/search?q=${encodeURIComponent(searchQuery)}`);
+      const resp = await apiFetch(`${API_URL}/api/search?q=${encodeURIComponent(searchQuery)}`);
       const data = await resp.json();
       const cands: SearchCandidate[] = data.candidates ?? [];
       if (cands.length === 1) {
@@ -1218,7 +1223,7 @@ export default function Dashboard() {
     if (!autoMode) setActiveTab("eval");
     try {
       const headers = { "Content-Type": "application/json", ...(await getAuthHeader()) };
-      const resp = await fetch(`${API_URL}/api/evaluate`, {
+      const resp = await apiFetch(`${API_URL}/api/evaluate`, {
         method: "POST", headers, body: JSON.stringify({ query: q }),
       });
       if (!resp.ok) throw new Error(`Eval API ${resp.status}`);
@@ -1249,7 +1254,7 @@ export default function Dashboard() {
           source: e.source, url: e.url, year: e.year, authors: e.authors,
         })),
       };
-      const resp = await fetch(`${API_URL}/api/ref/beta`, {
+      const resp = await apiFetch(`${API_URL}/api/ref/beta`, {
         method: "POST", headers, body: JSON.stringify(body),
       });
       if (!resp.ok) {

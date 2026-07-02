@@ -14,7 +14,7 @@ export default function AuthCallback() {
     if (!code) { navigate("/"); return; }
     fetch(`${API_URL}/api/auth/linkedin/exchange`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
       body: JSON.stringify({ code, redirect_uri: `${window.location.origin}/auth/callback` }),
     }).then(r => r.json()).then(data => {
       if (data.token) {
