@@ -166,6 +166,52 @@ def _provider_label() -> str:
     return "deterministic"
 
 
+# Reference priority: downstream-impact adopters first, then applied-adoption
+# signals, then citations. This ordering decides the [n] numbering.
+_REF_PRIORITY = {"downstream": 0, "patent": 1, "code": 2, "funding": 3, "citation": 4, "full_text": 5}
+
+
+def build_references(evidence: list[EvidenceItem], max_refs: int = 6,
+                     exclude_doi: str | None = None, exclude_title: str | None = None) -> list[dict]:
+    """Build the numbered reference list the summary cites with [n].
+
+    Prioritises high-impact downstream adopters, then applied-adoption signals,
+    then ordinary citations — so the most impact-bearing sources get the low
+    numbers the model is told to lead with. The source paper itself is excluded
+    (it is referred to as 'Author et al.', not cited as a reference)."""
+    xd = (exclude_doi or "").lower().replace("https://doi.org/", "").strip()
+    xt = (exclude_title or "").lower().strip()
+
+    def is_self(e: EvidenceItem) -> bool:
+        ed = (e.url or "").lower().replace("https://doi.org/", "")
+        if xd and xd in ed:
+            return True
+        if xt and e.title and e.title.lower().strip() == xt:
+            return True
+        return False
+
+    ranked = sorted(
+        (e for e in evidence if not is_self(e)),
+        key=lambda e: (_REF_PRIORITY.get(e.kind, 9), -(e.citation_count or 0)),
+    )
+    refs: list[dict] = []
+    for e in ranked[:max_refs]:
+        if e.authors:
+            who = f"{e.authors[0].split()[-1]} et al." if len(e.authors) > 1 else e.authors[0]
+        else:
+            who = e.source
+        label = f"{who} ({e.year or 'n.d.'}). {e.title[:100]}. {e.source}."
+        note = (e.snippet or "")[:90] if e.kind == "downstream" else None
+        refs.append({
+            "n": len(refs) + 1,
+            "label": label,
+            "url": e.url,
+            "kind": e.kind,
+            "note": note,
+        })
+    return refs
+
+
 # ── HFSynthesizer (same public interface, new multi-provider internals) ───────
 
 class HFSynthesizer:
@@ -181,53 +227,179 @@ class HFSynthesizer:
         evidence: list[EvidenceItem],
         topics: list[str],
         rag_contexts: list[str],
-    ) -> tuple[str | None, str, list[TraceLog]]:
+    ) -> tuple[str | None, str, list[dict], list[TraceLog]]:
         logs: list[TraceLog] = []
+        references = build_references(evidence, exclude_doi=metadata.doi, exclude_title=metadata.title)
         if not self.enabled():
             logs.append(log("LLM", "No LLM key set — using deterministic synthesis. Add GROQ_API_KEY or GOOGLE_API_KEY to backend/.env."))
-            return None, "deterministic", logs
+            return None, "deterministic", references, logs
 
-        ev = "\n".join(
-            f"- [{e.kind.upper()}] {e.title} ({e.source}, {e.year or 'n.d.'}) — {(e.snippet or '')[:200]}"
-            for e in evidence[:12]
-        )
+        # Numbered reference block the model must cite from. Numbers here MUST
+        # match the references returned to the UI.
+        ref_block = "\n".join(
+            f"[{r['n']}] ({r['kind']}) {r['label']}" + (f" — {r['note']}" if r.get("note") else "")
+            for r in references
+        ) or "No external sources retrieved."
+
+        first_author = (metadata.authors[0].split()[-1] if metadata.authors else "the authors")
+        etal = f"{first_author} et al. ({metadata.year or 'n.d.'})"
 
         system = (
-            "You are a rigorous UK Research Excellence Framework (REF) impact analyst. "
-            "Ground every claim in the provided evidence. Do not invent statistics, companies, or institutions. "
-            "Acknowledge uncertainty only when evidence is genuinely thin. "
-            "Write in the style of a REF impact case study: dense, evidence-grounded academic prose."
+            "You are a senior UK Research Excellence Framework (REF) impact assessor writing "
+            "the 'summary of the impact' for a 4*-grade case study. Your prose is dense, "
+            "specific, and impact-led: lead with the contribution, then evidence reach through "
+            "concrete downstream outcomes — high-impact citing work, funded follow-on research, "
+            "patents, and code adoption. Cite every external claim with a bracketed number [n] "
+            "drawn ONLY from the numbered references provided. Refer to the paper itself as "
+            "'<Author> et al. (year)'. Never invent companies, acquisitions, grants, or statistics "
+            "— if an outcome is not in the references, do not state it."
         )
-        user = f"""Write a single REF-style impact paragraph. Target length: 120–130 words.
 
-Paper: {metadata.title}
-Authors: {", ".join(metadata.authors[:3]) or "Unknown"}
-Year: {metadata.year or "Unknown"}
-Citations: {citation_count:,}
+        user = f"""Write the REF 'summary of the impact' for this paper. Aim for ~100 words (90–115 acceptable), ONE flowing paragraph.
 
-Evidence:
-{ev or "No evidence retrieved."}
+Paper (the subject): {metadata.title}
+Refer to it as: {etal}
+Headline citations: {citation_count:,}
 
-CONTENT — five sentences, each 24–26 words:
-  1. What the paper introduced and why it was a significant contribution to its field.
-  2. Citation reach: state {citation_count:,} citations and name 2 specific citing works from the evidence above.
-  3. Real-world adoption: name a specific patent AND a specific code repository from the evidence, with details.
-  4. A second adoption pathway or an honest acknowledgement of what evidence is missing.
-  5. Overall significance and lasting impact on the field.
+Numbered references — these are the ONLY facts you may state. Cite each by its number [n]:
+{ref_block}
 
-FORMAT:
-- ONE flowing paragraph. No headings, no lists, no bullet points.
-- Use **bold** on exactly 3–4 key phrases.
-- No invented facts — every claim must appear in the evidence above."""
+HOW TO WRITE IT (grounded, no invention):
+1. Open with one sentence on what {etal} introduced and why it mattered to its field.
+2. Then write ONE dedicated sentence for EACH reference above (cover as many as you can — that is how you reach length), describing what that reference actually is — its topic/title and its citation figure or funder — and what it shows about downstream uptake, tagged with its [n]. Prefer references that out-cite the source paper or carry grant funding.
+3. Close with one sentence on overall significance.
 
-        summary = _call(system, user, max_tokens=500)
+STRICT RULES:
+- Length must come from covering MORE references, never from repetition or filler. Do NOT pad with phrases like 'highlighting the overall significance' or restating citation counts you already mentioned.
+- Describe only what each reference literally is. Do NOT write 'follow-on collaboration', 'taken up by industry', 'spun out a company', 'presented to', or any outcome not written in a reference. If a reference is just a highly-cited citing paper, say exactly that (e.g. "a widely-cited work on X [n] (12,000 citations)").
+- One paragraph, no headings/lists. Use 'et al.' for the paper; put [n] inline next to each supported claim; bold 2–3 key phrases with **double asterisks**.
+- If downstream evidence is genuinely thin, state that honestly instead of inventing reach."""
+
+        summary = _call(system, user, max_tokens=420)
+        # Length-repair pass: models routinely under-shoot. If short, expand once
+        # using ONLY the same references (no new facts) to hit the REF target.
+        if summary and len(summary.split()) < 85:
+            expanded = _call(
+                system,
+                "This REF impact summary is too short at "
+                f"{len(summary.split())} words. Rewrite it to ~100 words using ONLY the references "
+                "below — add no new facts, invent no outcomes. Reach the length by adding ONE new "
+                "sentence for each reference you have not yet described (not by repeating points). "
+                "Keep the [n] citations, the 'et al.' reference, and 2–3 **bold** phrases.\n\n"
+                f"CURRENT SUMMARY:\n{summary}\n\nREFERENCES:\n{ref_block}",
+                max_tokens=420,
+            )
+            if expanded and len(expanded.split()) > len(summary.split()):
+                logs.append(log("LLM", f"Expanded summary {len(summary.split())}→{len(expanded.split())} words for REF length target"))
+                summary = expanded
         if summary:
             provider = _provider_label()
-            logs.append(log("LLM", f"{provider.split(':')[0].title()} generated impact narrative", model=provider, words=len(summary.split())))
-            return summary, provider, logs
+            logs.append(log("LLM", f"{provider.split(':')[0].title()} generated REF impact narrative", model=provider, words=len(summary.split()), refs=len(references)))
+            return summary, provider, references, logs
 
         err = _last_error[-1] if _last_error else "unknown error"
         logs.append(log("LLM", f"LLM failed ({err[:80]}) — falling back to deterministic synthesis"))
+        return None, "deterministic", references, logs
+
+    def draft_sentences(
+        self,
+        metadata: PaperMetadata,
+        citation_count: int,
+        evidence: list[EvidenceItem],
+    ) -> tuple[list[dict], list[TraceLog]]:
+        """Human-in-the-loop step: draft ONE factual, evidence-grounded
+        candidate sentence per evidence item for the reviewer to curate. Each
+        sentence stays strictly faithful to its single source."""
+        logs: list[TraceLog] = []
+        items = evidence[:24]
+        etal = f"{(metadata.authors[0].split()[-1] if metadata.authors else 'the authors')} et al. ({metadata.year or 'n.d.'})"
+
+        def _fallback(e: EvidenceItem) -> str:
+            bits = f"{e.kind.replace('_', ' ')} from {e.source}"
+            cc = f" ({e.citation_count:,} citations)" if e.citation_count else ""
+            return f"{e.title}{cc} — {bits} evidencing downstream engagement with the work."
+
+        parsed: dict[int, str] = {}
+        if self.enabled() and items:
+            ev_block = "\n".join(
+                f"{i+1}. [{e.kind}] {e.title} ({e.source}, {e.year or 'n.d.'})"
+                + (f", {e.citation_count:,} citations" if e.citation_count else "")
+                + (f" — {(e.snippet or '')[:160]}" if e.snippet else "")
+                for i, e in enumerate(items)
+            )
+            system = (
+                "You are a UK REF impact analyst drafting candidate evidence sentences "
+                "for human review. Each sentence states ONE fact grounded strictly in its "
+                "evidence item. Never invent outcomes, companies, or statistics."
+            )
+            user = (
+                f"Paper: {metadata.title} ({etal}). Headline citations: {citation_count:,}.\n\n"
+                "For EACH numbered evidence item below, write ONE concise, factual sentence "
+                "(18-32 words) describing what it shows about the paper's real-world or academic "
+                "impact. Stay strictly faithful to that item; do not invent. Output exactly one "
+                "numbered line per item, reusing the same numbers, and nothing else.\n\n"
+                f"Evidence:\n{ev_block}"
+            )
+            raw = _call(system, user, max_tokens=1400)
+            if raw:
+                for line in raw.splitlines():
+                    m = re.match(r"\s*(\d+)[\.\)]\s*(.+\S)", line)
+                    if m:
+                        parsed[int(m.group(1))] = m.group(2).strip()
+                logs.append(log("Draft", f"Drafted {len(parsed)} candidate sentences", model=_provider_label()))
+            else:
+                logs.append(log("Draft", "LLM unavailable — using deterministic candidate sentences"))
+
+        candidates: list[dict] = []
+        for i, e in enumerate(items):
+            candidates.append({
+                "id": i,
+                "text": parsed.get(i + 1) or _fallback(e),
+                "kind": e.kind,
+                "source": e.source,
+                "title": e.title,
+                "url": e.url,
+                "year": e.year,
+                "citations": e.citation_count,
+            })
+        return candidates, logs
+
+    def compose(
+        self,
+        metadata: PaperMetadata,
+        citation_count: int,
+        sentences: list[str],
+        references: list[dict],
+    ) -> tuple[str | None, str, list[TraceLog]]:
+        """Weave the reviewer-approved sentences into ONE flowing REF impact
+        paragraph. Uses only the facts already present in those sentences."""
+        logs: list[TraceLog] = []
+        if not self.enabled() or not sentences:
+            return None, "deterministic", logs
+        etal = f"{(metadata.authors[0].split()[-1] if metadata.authors else 'the authors')} et al. ({metadata.year or 'n.d.'})"
+        sent_block = "\n".join(f"- {s}" for s in sentences)
+        ref_block = "\n".join(f"[{r['n']}] {r['label']}" for r in references) or "None."
+        system = (
+            "You are a senior UK REF impact assessor. You are given a set of "
+            "reviewer-APPROVED, evidence-grounded sentences. Weave them into a single "
+            "flowing impact paragraph using ONLY the facts they contain — add nothing, "
+            "invent nothing, and drop none of their substance."
+        )
+        user = (
+            f"Refer to the paper as: {etal}. Headline citations: {citation_count:,}.\n\n"
+            "Approved sentences (incorporate every one's fact):\n"
+            f"{sent_block}\n\n"
+            "Reference list — cite inline as [n] where a sentence draws on a source:\n"
+            f"{ref_block}\n\n"
+            "Write ONE cohesive ~100-word paragraph: open with what the paper introduced, "
+            "then present the approved impact facts in a logical order with [n] citations and "
+            "2-3 **bold** key phrases. One paragraph, no headings or lists, no new facts."
+        )
+        summary = _call(system, user, max_tokens=420)
+        if summary:
+            provider = _provider_label()
+            logs.append(log("LLM", f"{provider.split(':')[0].title()} composed summary from {len(sentences)} approved sentences", model=provider, words=len(summary.split())))
+            return summary, provider, logs
         return None, "deterministic", logs
 
     def generate_ref_report(

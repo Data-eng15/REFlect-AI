@@ -11,16 +11,23 @@ export default function AuthCallback() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
+    const state = params.get("state");
     if (!code) { navigate("/"); return; }
-    fetch(`${API_URL}/api/auth/linkedin/exchange`, {
+    const isOrcid = state === "orcid";
+    const endpoint = isOrcid ? "/api/auth/orcid/exchange" : "/api/auth/linkedin/exchange";
+    fetch(`${API_URL}${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code, redirect_uri: `${window.location.origin}/auth/callback` }),
     }).then(r => r.json()).then(data => {
       if (data.token) {
-        sessionStorage.setItem("li_token", data.token);
-        sessionStorage.setItem("li_user", JSON.stringify({ uid: data.uid, email: data.email, displayName: data.name, photoURL: null }));
-        setLinkedinUser({ uid: data.uid, email: data.email, displayName: data.name, photoURL: null, provider: "linkedin", getToken: async () => data.token });
+        const provider = isOrcid ? "orcid" : "linkedin";
+        const tokenKey = isOrcid ? "orcid_token" : "li_token";
+        const userKey = isOrcid ? "orcid_user" : "li_user";
+        const u = { uid: data.uid, email: data.email, displayName: data.name, photoURL: null, orcid: data.orcid ?? null };
+        sessionStorage.setItem(tokenKey, data.token);
+        sessionStorage.setItem(userKey, JSON.stringify(u));
+        setLinkedinUser({ ...u, provider, getToken: async () => data.token });
       }
       navigate("/dashboard");
     }).catch(() => navigate("/"));

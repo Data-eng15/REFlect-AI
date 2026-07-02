@@ -2,7 +2,7 @@
 Evaluation module — two baselines for comparison:
 
   Baseline A (CrossRef-only, no RAG):   original single-source baseline.
-  Baseline B (naive multi-source RAG):  same 6 APIs as Veritrace but with
+  Baseline B (naive multi-source RAG):  same 6 APIs as REFlect AI but with
                                          simple keyword retrieval instead of
                                          semantic vector search.
 
@@ -126,7 +126,7 @@ async def _fetch_naive_evidence(query: str, title: str) -> tuple[list[str], list
     sources: list[str] = []
 
     async with httpx.AsyncClient(
-        headers={"User-Agent": "VeritraceEval/0.1 (research@veritrace.ai)"}
+        headers={"User-Agent": "REFlectAI-Eval/0.1 (research@reflect.ai)"}
     ) as client:
 
         # 1. Semantic Scholar title search
@@ -245,7 +245,7 @@ async def _fetch_naive_evidence(query: str, title: str) -> tuple[list[str], list
 
 async def run_naive_rag_baseline(query: str) -> dict[str, Any]:
     """Baseline B — naive multi-source RAG.
-    Fetches evidence from the same 6 APIs as Veritrace but uses simple keyword
+    Fetches evidence from the same 6 APIs as REFlect AI but uses simple keyword
     concatenation instead of semantic vector retrieval."""
     t0 = time.perf_counter()
     work = await _fetch_crossref_simple(query)
@@ -301,7 +301,7 @@ async def run_naive_rag_baseline(query: str) -> dict[str, Any]:
 # ── Three-way comparison ──────────────────────────────────────────────────────
 
 async def run_comparison(query: str, agentic_result: dict[str, Any]) -> dict[str, Any]:
-    """Compare Veritrace against both baselines simultaneously."""
+    """Compare REFlect AI against both baselines simultaneously."""
     baseline_a, baseline_b = await asyncio.gather(
         run_baseline(query),
         run_naive_rag_baseline(query),
@@ -348,7 +348,7 @@ async def run_comparison(query: str, agentic_result: dict[str, Any]) -> dict[str
         "baseline_b_faithfulness": round(bb_faith, 2),
         "agentic": {
             "approach": "agentic",
-            "label": "Veritrace (semantic RAG + dual-LLM validation)",
+            "label": "REFlect AI (semantic RAG + dual-LLM validation)",
             "summary": agentic_result.get("summary", ""),
             "citation_count": agentic_result.get("citation_count", 0),
             "evidence_count": len(evidence_items),
@@ -368,16 +368,16 @@ def _verdict(ag: float, ba: float, bb: float, ag_ev: int, bb_ev: int) -> str:
     delta_a = ag - ba
     delta_b = ag - bb
     if delta_b >= 0.15 and ag_ev > bb_ev:
-        return ("Veritrace significantly outperforms both baselines — semantic RAG "
+        return ("REFlect AI significantly outperforms both baselines — semantic RAG "
                 "and dual-LLM validation provide measurable quality gains.")
     if delta_b >= 0.05:
-        return ("Veritrace moderately outperforms the naive multi-source RAG baseline, "
+        return ("REFlect AI moderately outperforms the naive multi-source RAG baseline, "
                 "confirming the value of semantic retrieval and validation.")
     if abs(delta_b) < 0.05:
-        return ("Veritrace and naive RAG are comparable in faithfulness; "
-                "Veritrace provides richer evidence breadth and validated quality scores.")
+        return ("REFlect AI and naive RAG are comparable in faithfulness; "
+                "REFlect AI provides richer evidence breadth and validated quality scores.")
     if delta_a >= 0.10:
-        return ("Veritrace outperforms CrossRef-only baseline; "
+        return ("REFlect AI outperforms CrossRef-only baseline; "
                 "gains over naive RAG are marginal — consider tuning retrieval depth.")
     return ("Baselines competitive on this query — all three approaches achieve "
             "similar faithfulness. Consider increasing evidence sources for this domain.")

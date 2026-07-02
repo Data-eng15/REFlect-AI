@@ -1,5 +1,5 @@
 from __future__ import annotations
-import csv, io, os, time
+import asyncio, csv, io, os, time, uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -11,18 +11,20 @@ import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
-from .auth import create_linkedin_token, get_current_uid, get_current_user
+from .auth import create_linkedin_token, create_orcid_token, get_current_uid, get_current_user
+from .profile import build_profile
+from .domain_classifier import plan_routing
 from .access_guard import DEMO_MODE, check_author_access
 from .database import get_calibration_report, get_dataset_rows, get_evaluations, get_stats, get_user_history, init_db, save_analysis, save_calibration, save_evaluation
 from .evaluation import run_comparison
 from .models import AnalyzeRequest, AnalyzeResponse
 from .ref_beta import run_beta_ref
-from .services import analyze_paper
+from .services import analyze_paper, compose_summary
 from .validation import classify_query, validate_query
 
-app = FastAPI(title="Veritrace API", version="0.5.0")
+app = FastAPI(title="REFlect AI API", version="0.5.0")
 
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 
@@ -46,6 +48,12 @@ LINKEDIN_CLIENT_ID     = os.getenv("LINKEDIN_CLIENT_ID","")
 LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET","")
 LINKEDIN_TOKEN_URL     = "https://www.linkedin.com/oauth/v2/accessToken"
 LINKEDIN_USERINFO_URL  = "https://api.linkedin.com/v2/userinfo"
+
+# ORCID OAuth. Base defaults to production; set ORCID_OAUTH_BASE=https://sandbox.orcid.org for testing.
+ORCID_CLIENT_ID     = os.getenv("ORCID_CLIENT_ID","")
+ORCID_CLIENT_SECRET = os.getenv("ORCID_CLIENT_SECRET","")
+ORCID_OAUTH_BASE    = os.getenv("ORCID_OAUTH_BASE","https://orcid.org").rstrip("/")
+ORCID_CONFIGURED    = bool(ORCID_CLIENT_ID and ORCID_CLIENT_SECRET)
 
 @app.on_event("startup")
 async def startup() -> None:
@@ -86,59 +94,38 @@ def _is_junk_doi(doi: str | None) -> bool:
 async def _candidates_semantic_scholar(client: httpx.AsyncClient, q: str) -> list[dict]:
     """Semantic Scholar candidates — the only reliable source for canonical
     high-impact papers (e.g. the original 2017 'Attention Is All You Need').
-    Uses autocomplete + batch fetch, each retried once on rate-limit, so a
-    transient 429 doesn't silently drop the field-defining paper."""
+    Uses the relevance /paper/search endpoint (returns citation counts directly,
+    and consistently ranks the field-defining paper first), retried on 429. The
+    /paper/autocomplete endpoint was found to 429 even with an API key, so it is
+    no longer used."""
     import asyncio as _aio
     out: list[dict] = []
     key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
     headers = {"x-api-key": key} if key else {}
+    _ATTEMPTS = 3
 
     async def _get_with_retry(url, **kw):
-        for attempt in range(2):
+        for attempt in range(_ATTEMPTS):
             try:
-                r = await client.get(url, headers=headers, timeout=10, **kw)
-                if r.status_code == 429 and attempt == 0:
-                    await _aio.sleep(1.5)
+                r = await client.get(url, headers=headers, timeout=12, **kw)
+                if r.status_code == 429 and attempt < _ATTEMPTS - 1:
+                    await _aio.sleep(1.5 * (attempt + 1))
                     continue
                 return r
             except Exception:
-                if attempt == 0:
-                    await _aio.sleep(1.0)
+                if attempt < _ATTEMPTS - 1:
+                    await _aio.sleep(1.0 * (attempt + 1))
                     continue
                 return None
         return None
 
-    async def _post_with_retry(url, **kw):
-        for attempt in range(2):
-            try:
-                r = await client.post(url, headers=headers, timeout=15, **kw)
-                if r.status_code == 429 and attempt == 0:
-                    await _aio.sleep(1.5)
-                    continue
-                return r
-            except Exception:
-                if attempt == 0:
-                    await _aio.sleep(1.0)
-                    continue
-                return None
-        return None
-
-    # 1. autocomplete -> ranked paper IDs
-    ac = await _get_with_retry(
-        "https://api.semanticscholar.org/graph/v1/paper/autocomplete",
-        params={"query": q})
-    ids = [m["id"] for m in ac.json().get("matches", [])[:8] if m.get("id")] if (ac and ac.is_success) else []
-    if not ids:
-        return out
-
-    # 2. batch fetch ALL details in a single request
-    r = await _post_with_retry(
-        "https://api.semanticscholar.org/graph/v1/paper/batch",
-        params={"fields": "title,year,authors,externalIds,citationCount,venue"},
-        json={"ids": ids})
+    r = await _get_with_retry(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        params={"query": q, "limit": 10,
+                "fields": "title,year,authors,externalIds,citationCount,venue"})
     if not r or not r.is_success:
         return out
-    for p in r.json():
+    for p in (r.json().get("data") or []):
         if not p:
             continue
         ext = p.get("externalIds") or {}
@@ -192,7 +179,7 @@ async def _candidates_openalex(client: httpx.AsyncClient, q: str) -> list[dict]:
 
 
 _search_cache: dict[str, tuple[float, dict]] = {}
-_SEARCH_TTL = 600  # seconds
+_SEARCH_TTL = 21600  # 6h — once a canonical paper is resolved, never regress
 
 @app.get("/api/search")
 async def search(request: Request, q: str = "") -> dict:
@@ -254,13 +241,19 @@ async def search(request: Request, q: str = "") -> dict:
     # Tie-break: older year first (the original precedes republications).
     candidates.sort(key=lambda c: (-(c.get("citation_count") or 0), c.get("year") or 9999))
     candidates = candidates[:6]
-    if candidates:
-        candidates[0]["is_top_impact"] = True  # highlight the highest-impact paper
 
-    result = {"query": safe_q, "kind": kind, "candidates": candidates}
-    # Cache only confident results (Semantic Scholar contributed canonical data).
-    # If SS failed entirely, skip caching so the next request retries it.
-    if ss and candidates:
+    # Semantic Scholar is the ONLY source that reliably surfaces canonical,
+    # field-defining papers (OpenAlex/CrossRef title search miss e.g. the 2017
+    # "Attention Is All You Need"). So only claim a confident "highest impact"
+    # when SS actually contributed; otherwise flag the result as low-confidence
+    # and let the UI warn rather than badge a possibly-wrong paper.
+    ss_ok = bool(ss)
+    if candidates and ss_ok:
+        candidates[0]["is_top_impact"] = True
+
+    result = {"query": safe_q, "kind": kind, "candidates": candidates, "low_confidence": not ss_ok}
+    # Cache only confident results; if SS failed, skip caching so we retry it.
+    if ss_ok and candidates:
         _search_cache[cache_key] = (time.time(), result)
     return result
 
@@ -275,18 +268,94 @@ async def _crossref_title(client: httpx.AsyncClient, q: str) -> list[dict]:
         pass
     return []
 
+# Server-side draft store for the human-in-the-loop curation step. Holds the
+# gathered evidence + candidate sentences between /api/analyze and /api/compose.
+_draft_store: dict[str, tuple[float, dict]] = {}
+_DRAFT_TTL = 1800  # 30 min
+
+def _prune_drafts() -> None:
+    now = time.time()
+    for k in [k for k, (t, _) in _draft_store.items() if now - t > _DRAFT_TTL]:
+        _draft_store.pop(k, None)
+
 @app.post("/api/analyze")
 async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_user: Optional[dict] = Depends(get_current_user)) -> dict:
+    """Stage 1: gather evidence and draft one candidate sentence per evidence
+    item for human curation. Does NOT produce the final summary — that happens
+    in /api/compose once the reviewer selects sentences."""
     rate_limit(request, limit=10, window=60)
     try: safe_query = validate_query(body.query)
     except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc))
-    uid = current_user["uid"] if current_user else None
-    result = await analyze_paper(safe_query)
-    save_analysis(result, user_uid=uid)
+    result = await analyze_paper(safe_query, fields=body.fields)
     meta = result.get("metadata")
     access = await check_author_access(doi=meta.doi if meta else None, user_name=current_user.get("name") if current_user else None, paper_authors=meta.authors if meta else None)
-    response = AnalyzeResponse(**result).model_dump()
-    response["access"] = access
+
+    _prune_drafts()
+    draft_id = uuid.uuid4().hex
+    _draft_store[draft_id] = (time.time(), {**result, "uid": current_user["uid"] if current_user else None})
+
+    return {
+        "draft_id": draft_id,
+        "stage": "draft",
+        "metadata": meta,
+        "evidence": result["evidence"],
+        "candidates": result["candidates"],
+        "agent_statuses": result["agent_statuses"],
+        "logs": result["logs"],
+        "citation_count": result["citation_count"],
+        "topics": result["topics"],
+        "rag_context_count": result["rag_context_count"],
+        "routing": result.get("routing", {}),
+        "access": access,
+    }
+
+class ComposeRequest(BaseModel):
+    draft_id: str
+    selected_ids: list[int] = Field(default_factory=list)
+
+@app.post("/api/compose")
+async def compose(request: Request, body: ComposeRequest = Body(...), current_user: Optional[dict] = Depends(get_current_user)) -> dict:
+    """Stage 2: weave the reviewer-approved candidate sentences into the final
+    REF summary, validate it, and return the full result."""
+    rate_limit(request, limit=10, window=60)
+    entry = _draft_store.get(body.draft_id)
+    if not entry or (time.time() - entry[0]) > _DRAFT_TTL:
+        raise HTTPException(status_code=404, detail="Draft expired — please re-run the analysis.")
+    st = entry[1]
+    evidence = st["evidence"]
+    sel = set(body.selected_ids)
+    selected = [c for c in st["candidates"] if c["id"] in sel]
+    if not selected:
+        raise HTTPException(status_code=422, detail="Select at least one sentence to compose a summary.")
+    selected_evidence = [evidence[c["id"]] for c in selected if c["id"] < len(evidence)]
+    sentences = [c["text"] for c in selected]
+
+    comp = await asyncio.to_thread(
+        compose_summary, st["metadata"], st["citation_count"], st["topics"],
+        selected_evidence, sentences, st.get("rag_contexts", []),
+    )
+    full = {
+        "metadata": st["metadata"],
+        "summary": comp["summary"],
+        "sections": comp["sections"],
+        "evidence": evidence[:32],
+        "agent_statuses": st["agent_statuses"],
+        "logs": st["logs"] + comp["logs"],
+        "faithfulness_score": comp["faithfulness_score"],
+        "citation_count": comp["citation_count"],
+        "topics": comp["topics"],
+        "model_provider": comp["model_provider"],
+        "rag_context_count": st["rag_context_count"],
+        "guardrail_status": comp["guardrail_status"],
+        "limitations": comp["limitations"],
+        "ref_report": comp["ref_report"],
+        "validation_report": comp["validation_report"],
+    }
+    save_analysis(full, user_uid=st.get("uid"))
+    response = AnalyzeResponse(**full).model_dump()
+    response["access"] = await check_author_access(doi=st["metadata"].doi if st["metadata"] else None, user_name=current_user.get("name") if current_user else None, paper_authors=st["metadata"].authors if st["metadata"] else None)
+    response["routing"] = st.get("routing", {})
+    response["references"] = comp["references"]
     return response
 
 @app.get("/api/stats")
@@ -301,7 +370,7 @@ async def dataset(fmt: str = "json"):
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=rows[0].keys())
         writer.writeheader(); writer.writerows(rows); output.seek(0)
-        return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition":"attachment; filename=veritrace_dataset.csv"})
+        return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition":"attachment; filename=reflect_ai_dataset.csv"})
     return {"count":len(rows),"rows":rows}
 
 @app.get("/api/history")
@@ -409,3 +478,65 @@ async def linkedin_exchange(request: Request, body: LinkedInExchangeRequest = Bo
         email = profile.get("email",""); name = profile.get("name",profile.get("given_name","LinkedIn User"))
     jwt_token = create_linkedin_token(uid=uid, email=email, name=name)
     return {"token":jwt_token,"uid":uid,"email":email,"name":name}
+
+class OrcidExchangeRequest(BaseModel):
+    code: str; redirect_uri: str
+    @field_validator("code")
+    @classmethod
+    def code_must_be_short(cls, v: str) -> str:
+        if len(v) > 512: raise ValueError("Invalid authorization code")
+        return v
+
+@app.get("/api/auth/orcid/config")
+async def orcid_config() -> dict:
+    """Lets the frontend know whether to run real ORCID OAuth or the mock flow."""
+    return {"configured": ORCID_CONFIGURED, "client_id": ORCID_CLIENT_ID, "authorize_base": ORCID_OAUTH_BASE}
+
+@app.post("/api/auth/orcid/exchange")
+async def orcid_exchange(request: Request, body: OrcidExchangeRequest = Body(...)) -> dict:
+    rate_limit(request, limit=5, window=60)
+    # Mock fallback — no credentials configured. Lets the showcase run end-to-end
+    # without a registered ORCID client; flip on real OAuth by setting ORCID_CLIENT_ID/SECRET.
+    if not ORCID_CONFIGURED:
+        # Mock identity points at a real, resolvable ORCID so the personalised
+        # dashboard populates from live OpenAlex data. Override with DEMO_ORCID.
+        orcid = os.getenv("DEMO_ORCID", "0000-0002-9322-3515")
+        uid = f"orcid:{orcid}"; name = "Demo Researcher"; email = ""
+        jwt_token = create_orcid_token(uid=uid, email=email, name=name, orcid=orcid)
+        return {"token":jwt_token,"uid":uid,"email":email,"name":name,"orcid":orcid,"mock":True}
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(f"{ORCID_OAUTH_BASE}/oauth/token", data={"grant_type":"authorization_code","code":body.code,"redirect_uri":body.redirect_uri,"client_id":ORCID_CLIENT_ID,"client_secret":ORCID_CLIENT_SECRET}, headers={"Accept":"application/json","Content-Type":"application/x-www-form-urlencoded"}, timeout=15)
+        if not token_resp.is_success: raise HTTPException(status_code=400, detail="ORCID token exchange failed")
+        data = token_resp.json()
+        orcid = data.get("orcid",""); name = data.get("name") or "ORCID Researcher"
+        uid = f"orcid:{orcid or 'unknown'}"; email = ""
+    jwt_token = create_orcid_token(uid=uid, email=email, name=name, orcid=orcid)
+    return {"token":jwt_token,"uid":uid,"email":email,"name":name,"orcid":orcid}
+
+@app.get("/api/profile")
+async def researcher_profile(
+    request: Request,
+    orcid: Optional[str] = None,
+    name: Optional[str] = None,
+    affiliation: Optional[str] = None,
+) -> dict:
+    """Build a personalised researcher profile (top papers, fields, LLM summary)
+    from ORCID + OpenAlex. ?orcid=.. for ORCID users, or ?name=..&affiliation=..
+    for manually-registered users. Returns {resolved: false} if not found."""
+    rate_limit(request, limit=20, window=60)
+    if not orcid and not name:
+        raise HTTPException(status_code=422, detail="Provide an orcid or a name.")
+    profile = await build_profile(orcid=orcid, name=name, affiliation=affiliation)
+    if profile is None:
+        return {"resolved": False}
+    return {"resolved": True, "profile": profile}
+
+@app.get("/api/routing/plan")
+async def routing_plan(request: Request, fields: str = "", title: str = "") -> dict:
+    """Preview the dynamic source-routing decision for a researcher (and,
+    optionally, a specific paper). `fields` is a comma-separated list of the
+    researcher's OpenAlex fields; `title` optionally layers the paper's own
+    classified domain on top. Returns which sources will be queried vs skipped."""
+    rate_limit(request, limit=60, window=60)
+    field_list = [f.strip() for f in fields.split(",") if f.strip()]
+    return plan_routing(fields=field_list, title=title)

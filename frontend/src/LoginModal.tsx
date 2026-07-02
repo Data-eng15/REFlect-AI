@@ -46,7 +46,7 @@ export default function LoginModal({ onClose }: { onClose: () => void }) {
         </button>
 
         <div className="modal-header">
-          <div className="modal-title">Sign in to Impact Lab</div>
+          <div className="modal-title">Sign in to REFlect AI</div>
           <div className="modal-subtitle">Continue to your researcher workspace.</div>
         </div>
 

@@ -13,7 +13,12 @@ from typing_extensions import TypedDict
 
 from .models import AgentState, AgentStatus, EvidenceItem, ImpactSection, PaperMetadata, TraceLog
 from .rag import index_and_retrieve
-from .hf_synthesis import hf_synthesizer
+from .hf_synthesis import hf_synthesizer, build_references
+from .domain_classifier import plan_routing, ALL_SOURCES, OPTIONAL_SOURCES
+
+# Below this many post-dedup evidence items, a routed (narrowed) retrieval pass
+# falls back to querying the remaining sources to protect recall.
+MIN_ROUTED_EVIDENCE = 5
 
 
 DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._();/:A-Z0-9]+", re.IGNORECASE)
@@ -690,7 +695,7 @@ async def fetch_pubmed(client: httpx.AsyncClient, metadata: PaperMetadata) -> tu
         search_resp = await client.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
             params={"db": "pubmed", "term": f'"{title}"[Title]', "retmax": 8,
-                    "retmode": "json", "tool": "veritrace", "email": "research@veritrace.ai"},
+                    "retmode": "json", "tool": "reflect_ai", "email": "research@reflect.ai"},
             timeout=15,
         )
         if not search_resp.is_success:
@@ -704,7 +709,7 @@ async def fetch_pubmed(client: httpx.AsyncClient, metadata: PaperMetadata) -> tu
             search_resp2 = await client.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                 params={"db": "pubmed", "term": term, "retmax": 6,
-                        "retmode": "json", "tool": "veritrace", "email": "research@veritrace.ai"},
+                        "retmode": "json", "tool": "reflect_ai", "email": "research@reflect.ai"},
                 timeout=15,
             )
             if search_resp2.is_success:
@@ -718,7 +723,7 @@ async def fetch_pubmed(client: httpx.AsyncClient, metadata: PaperMetadata) -> tu
         summary_resp = await client.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
             params={"db": "pubmed", "id": ",".join(pmids[:6]), "retmode": "json",
-                    "tool": "veritrace", "email": "research@veritrace.ai"},
+                    "tool": "reflect_ai", "email": "research@reflect.ai"},
             timeout=15,
         )
         if not summary_resp.is_success:
@@ -1025,13 +1030,97 @@ async def fetch_google_patents(client: httpx.AsyncClient, metadata: PaperMetadat
         return [], logs
 
 
+_OPENALEX_BASE = "https://api.openalex.org"
+
+async def fetch_downstream_impact(
+    client: httpx.AsyncClient, metadata: PaperMetadata, citation_count: int
+) -> tuple[list[EvidenceItem], list[TraceLog]]:
+    """Second-order impact tracing (Phase 3).
+
+    Find papers that CITE this work and are themselves high-impact — i.e. they
+    out-cite the source paper, or carry their own grant funding. Such citers are
+    strong downstream evidence: the paper's influence is shown by the
+    significance of what it enabled. Each surfaced adopter (and its funder) can
+    then be cited in the impact narrative.
+    """
+    logs: list[TraceLog] = []
+    try:
+        work = None
+        if metadata.doi:
+            r = await client.get(f"{_OPENALEX_BASE}/works/doi:{metadata.doi}", params={"select": "id,cited_by_count"}, timeout=12)
+            if r.is_success:
+                work = r.json()
+        if work is None and metadata.title:
+            r = await client.get(f"{_OPENALEX_BASE}/works", params={"search": metadata.title, "per_page": 1, "select": "id,cited_by_count"}, timeout=12)
+            if r.is_success:
+                results = r.json().get("results") or []
+                work = results[0] if results else None
+        if not work:
+            logs.append(log("Downstream", "Could not resolve paper on OpenAlex for citation tracing"))
+            return [], logs
+
+        work_id = (work.get("id") or "").rstrip("/").split("/")[-1]
+        x_cites = work.get("cited_by_count") or citation_count or 0
+        # No `select` here: OpenAlex won't let `grants` be selected, and we need it.
+        resp = await client.get(f"{_OPENALEX_BASE}/works", params={
+            "filter": f"cites:{work_id}", "sort": "cited_by_count:desc", "per_page": 12,
+        }, timeout=15)
+        if not resp.is_success:
+            logs.append(log("Downstream", "Citing-works query failed", status=resp.status_code))
+            return [], logs
+
+        strong: list[EvidenceItem] = []   # out-cite the source, or carry grant funding
+        notable: list[EvidenceItem] = []  # otherwise the most influential citers
+        for idx, c in enumerate(resp.json().get("results", [])):
+            c_cites = c.get("cited_by_count", 0) or 0
+            grants = c.get("grants") or []
+            out_cites = c_cites > x_cites and x_cites > 0
+            authors = [a.get("author", {}).get("display_name", "") for a in (c.get("authorships") or [])[:3] if a.get("author")]
+            grant_note = ""
+            if grants:
+                g = grants[0]
+                award = f" {g['award_id']}" if g.get("award_id") else ""
+                grant_note = f" Funded follow-on research ({g.get('funder_display_name', 'a research funder')}{award})."
+            if out_cites:
+                snippet = f"Cites this work and is itself cited {c_cites:,} times — exceeding the source paper, a strong downstream-impact signal.{grant_note}"
+                label, value = "Out-cites source", f"{c_cites:,} cites"
+            elif grants:
+                snippet = f"Cites this work ({c_cites:,} citations).{grant_note}"
+                label, value = "Funder", grants[0].get("funder_display_name")
+            elif idx < 4 and c_cites >= 50:
+                snippet = f"A highly-cited work building on this paper ({c_cites:,} citations), evidencing downstream uptake."
+                label, value = "Citing work", f"{c_cites:,} cites"
+            else:
+                continue
+            item = EvidenceItem(
+                title=c.get("title") or "Untitled citing work",
+                url=c.get("doi"),
+                year=c.get("publication_year"),
+                authors=authors,
+                snippet=snippet,
+                source="OpenAlex",
+                kind="downstream",
+                citation_count=c_cites,
+                metric_label=label,
+                metric_value=value,
+            )
+            (strong if (out_cites or grants) else notable).append(item)
+
+        evidence = (strong + notable)[:5]
+        logs.append(log("Downstream", f"Traced {len(evidence)} downstream adopters ({len(strong)} strong)", source_citations=x_cites))
+        return evidence, logs
+    except Exception as exc:
+        logs.append(log("Downstream", "Downstream impact tracing failed", error=str(exc)))
+        return [], logs
+
+
 def synthesize(
     metadata: PaperMetadata,
     citation_count: int,
     evidence: list[EvidenceItem],
     topics: list[str],
     rag_contexts: list[str],
-) -> tuple[str, list[ImpactSection], float, list[str], list[TraceLog], str, str, dict]:
+) -> tuple[str, list[ImpactSection], float, list[str], list[TraceLog], str, str, dict, list[dict]]:
     logs = [log("Synthesis", "Generating evidence-grounded summary")]
     title = metadata.title
     year = metadata.year or "unknown year"
@@ -1047,7 +1136,7 @@ def synthesize(
     else:
         evidence_sentence = "The current run found limited downstream evidence, so the summary should be treated as preliminary."
 
-    hf_summary, model_provider, hf_logs = hf_synthesizer.generate(metadata, citation_count, evidence, topics, rag_contexts)
+    hf_summary, model_provider, references, hf_logs = hf_synthesizer.generate(metadata, citation_count, evidence, topics, rag_contexts)
     logs.extend(hf_logs)
 
     patent_ev  = [e for e in evidence if e.kind == "patent"]
@@ -1128,8 +1217,8 @@ def synthesize(
         limitations.append("AI narrative unavailable. Add GOOGLE_API_KEY to backend/.env for Gemini-powered summaries.")
 
     logs.append(log("Guardrail", "Faithfulness guardrail evaluated summary", faithfulness_score=faithfulness, status=guardrail_status))
-    logs.append(log("Synthesis", "Summary generated", faithfulness_score=faithfulness, model_provider=model_provider))
-    return summary, sections, faithfulness, limitations, logs, model_provider, guardrail_status, validation_report
+    logs.append(log("Synthesis", "Summary generated", faithfulness_score=faithfulness, model_provider=model_provider, references=len(references)))
+    return summary, sections, faithfulness, limitations, logs, model_provider, guardrail_status, validation_report, references
 
 
 def score_faithfulness(summary: str, evidence: list[EvidenceItem], rag_contexts: list[str], citation_count: int, topics: list[str]) -> float:
@@ -1162,6 +1251,10 @@ class AnalysisState(TypedDict, total=False):
     guardrail_status: str
     ref_report: str
     validation_report: dict
+    routing_fields: list[str]
+    routing_metadata: dict
+    references: list[dict]
+    candidates: list[dict]
 
 
 def initial_statuses() -> list[AgentStatus]:
@@ -1200,41 +1293,104 @@ async def retrieval_node(state: AnalysisState) -> AnalysisState:
     statuses[1] = status("scholar", "Scholar", AgentState.running, "Retrieving citations")
     statuses[2] = status("content", "Content", AgentState.running, "Finding full text and topics")
     statuses[3] = status("code", "Code", AgentState.running, "Searching repositories")
+
+    # Phase 2 — dynamic routing. Decide which sources to query from the
+    # researcher's profile fields + this paper's own classified domain. When no
+    # fields are supplied (e.g. anonymous), plan_routing returns all sources, so
+    # behaviour is identical to the original full-scan pipeline.
+    plan = plan_routing(
+        fields=state.get("routing_fields") or [],
+        title=metadata.title or "",
+        abstract=(getattr(metadata, "abstract", "") or ""),
+    )
+    active = list(plan["sources_called"])
+    logs.append(log(
+        "Router",
+        f"Domain routing ({plan['reason']}): {len(active)}/{len(ALL_SOURCES)} sources",
+        domains=plan["domains"], sources_called=active, sources_skipped=plan["sources_skipped"],
+    ))
+
     async with httpx.AsyncClient(headers={"User-Agent": "ResearchImpactSummariser/0.1 (mailto:student@example.com)"}) as client:
-        scholar_task       = fetch_semantic_scholar(client, metadata, normalized)
-        fallback_task      = fetch_openalex_fallback(client, metadata.title)
-        enrichment_task    = fetch_openalex_enrichment(client, metadata)
-        github_task        = fetch_github_adoption(client, metadata)
-        patent_task        = fetch_google_patents(client, metadata)
-        pubmed_task        = fetch_pubmed(client, metadata)
-        clinical_task      = fetch_clinical_trials(client, metadata)
-        softsci_task       = fetch_soft_sciences(client, metadata)
+        optional_callables = {
+            "github": lambda: fetch_github_adoption(client, metadata),
+            "patents": lambda: fetch_google_patents(client, metadata),
+            "pubmed": lambda: fetch_pubmed(client, metadata),
+            "clinical_trials": lambda: fetch_clinical_trials(client, metadata),
+            "soft_sciences": lambda: fetch_soft_sciences(client, metadata),
+        }
+
+        async def _no_ev():
+            return [], []
+
+        # Core sources always run; optional sources are gated by the routing plan.
+        scholar_task    = fetch_semantic_scholar(client, metadata, normalized)
+        fallback_task   = fetch_openalex_fallback(client, metadata.title)
+        enrichment_task = fetch_openalex_enrichment(client, metadata)
+        downstream_task = fetch_downstream_impact(client, metadata, state.get("citation_count", 0))
+        github_task     = optional_callables["github"]()          if "github" in active          else _no_ev()
+        patent_task     = optional_callables["patents"]()         if "patents" in active         else _no_ev()
+        pubmed_task     = optional_callables["pubmed"]()          if "pubmed" in active          else _no_ev()
+        clinical_task   = optional_callables["clinical_trials"]() if "clinical_trials" in active else _no_ev()
+        softsci_task    = optional_callables["soft_sciences"]()   if "soft_sciences" in active   else _no_ev()
         (
             (citation_count, scholar_evidence, scholar_logs),
             (fallback_count, fallback_evidence, fallback_logs),
             (content_evidence, topics, content_logs),
+            (downstream_evidence, downstream_logs),
             (code_evidence, code_logs),
             (patent_evidence, patent_logs),
             (pubmed_evidence, pubmed_logs),
             (clinical_evidence, clinical_logs),
             (softsci_evidence, softsci_logs),
         ) = await asyncio.gather(
-            scholar_task, fallback_task, enrichment_task,
+            scholar_task, fallback_task, enrichment_task, downstream_task,
             github_task, patent_task, pubmed_task, clinical_task, softsci_task,
         )
-    citation_count = citation_count or fallback_count
-    logs.extend(scholar_logs + fallback_logs + content_logs + code_logs
-                + patent_logs + pubmed_logs + clinical_logs + softsci_logs)
-    evidence = dedupe_evidence(
-        scholar_evidence + fallback_evidence + content_evidence
-        + code_evidence + patent_evidence + pubmed_evidence
-        + clinical_evidence + softsci_evidence
-    )
+        citation_count = citation_count or fallback_count
+        logs.extend(scholar_logs + fallback_logs + content_logs + downstream_logs + code_logs
+                    + patent_logs + pubmed_logs + clinical_logs + softsci_logs)
+        evidence = dedupe_evidence(
+            downstream_evidence + scholar_evidence + fallback_evidence + content_evidence
+            + code_evidence + patent_evidence + pubmed_evidence
+            + clinical_evidence + softsci_evidence
+        )
+
+        # Insufficient-evidence fallback: top up with the sources we skipped.
+        fallback_triggered = False
+        missing = [s for s in OPTIONAL_SOURCES if s not in active]
+        if missing and len(evidence) < MIN_ROUTED_EVIDENCE:
+            fallback_triggered = True
+            logs.append(log(
+                "Router",
+                f"Fallback: only {len(evidence)} items (<{MIN_ROUTED_EVIDENCE}); querying {len(missing)} skipped sources",
+                sources=missing,
+            ))
+            extra_results = await asyncio.gather(*[optional_callables[s]() for s in missing])
+            extra_ev: list[EvidenceItem] = []
+            for ev, lg in extra_results:
+                extra_ev += ev
+                logs.extend(lg)
+            evidence = dedupe_evidence(evidence + extra_ev)
+            active = active + missing
+
+    skipped = [s for s in ALL_SOURCES if s not in active]
+    routing_metadata = {
+        "reason": f"{plan['reason']}+fallback" if fallback_triggered else plan["reason"],
+        "domains": plan["domains"],
+        "profile_domains": plan["profile_domains"],
+        "paper_domains": plan["paper_domains"],
+        "sources_called": active,
+        "sources_skipped": skipped,
+        "all_sources": list(ALL_SOURCES),
+        "fallback_triggered": fallback_triggered,
+        "evidence_count": len(evidence),
+        "saved_calls": len(skipped),
+    }
     statuses[1] = status("scholar", "Scholar", AgentState.complete if evidence else AgentState.warning, f"{len(evidence)} evidence items retrieved")
     statuses[2] = status("content", "Content", AgentState.complete if content_evidence or topics else AgentState.warning, f"{len(topics)} topics, {len(content_evidence)} links")
     statuses[3] = status("code", "Code", AgentState.complete if code_evidence else AgentState.warning, f"{len(code_evidence)} repository leads")
-    statuses[5] = status("impact", "Impact", AgentState.complete, "Patent search lead prepared")
-    return {**state, "citation_count": citation_count, "evidence": evidence, "topics": topics, "statuses": statuses, "logs": logs}
+    statuses[5] = status("impact", "Impact", AgentState.complete, f"Routed to {len(active)}/{len(ALL_SOURCES)} sources")
+    return {**state, "citation_count": citation_count, "evidence": evidence, "topics": topics, "routing_metadata": routing_metadata, "statuses": statuses, "logs": logs}
 
 
 async def rag_node(state: AnalysisState) -> AnalysisState:
@@ -1251,7 +1407,7 @@ async def synthesis_node(state: AnalysisState) -> AnalysisState:
     logs = state["logs"]
     statuses = state["statuses"]
     statuses[6] = status("synthesis", "Synthesis", AgentState.running, "Synthesizing summary")
-    summary, sections, faithfulness, limitations, synth_logs, model_provider, guardrail_status, validation_report = await asyncio.to_thread(
+    summary, sections, faithfulness, limitations, synth_logs, model_provider, guardrail_status, validation_report, references = await asyncio.to_thread(
         synthesize,
         state["metadata"],
         state["citation_count"],
@@ -1273,6 +1429,7 @@ async def synthesis_node(state: AnalysisState) -> AnalysisState:
         "model_provider": model_provider,
         "guardrail_status": guardrail_status,
         "validation_report": validation_report,
+        "references": references,
     }
 
 
@@ -1300,26 +1457,44 @@ async def ref_node(state: AnalysisState) -> AnalysisState:
     return {**state, "ref_report": hf_report, "statuses": statuses, "logs": logs}
 
 
+async def draft_node(state: AnalysisState) -> AnalysisState:
+    """Human-in-the-loop: draft one evidence-grounded candidate sentence per
+    evidence item for the reviewer to curate (replaces direct synthesis)."""
+    logs = state["logs"]
+    statuses = state["statuses"]
+    statuses[6] = status("synthesis", "Drafting", AgentState.running, "Drafting candidate sentences")
+    candidates, draft_logs = await asyncio.to_thread(
+        hf_synthesizer.draft_sentences,
+        state["metadata"], state["citation_count"], state["evidence"],
+    )
+    logs.extend(draft_logs)
+    statuses[6] = status("synthesis", "Drafting", AgentState.complete, f"{len(candidates)} candidate sentences ready for review")
+    logs.append(log("Supervisor", "Evidence gathered — awaiting reviewer sentence selection"))
+    return {**state, "candidates": candidates, "statuses": statuses, "logs": logs}
+
+
 def build_graph():
+    """Draft pipeline: retrieve evidence, then stop at candidate sentences for
+    human curation. Final synthesis happens later via compose_summary()."""
     graph = StateGraph(AnalysisState)
     graph.add_node("metadata", metadata_node)
     graph.add_node("retrieval", retrieval_node)
     graph.add_node("rag", rag_node)
-    graph.add_node("synthesis", synthesis_node)
-    graph.add_node("ref_report", ref_node)
+    graph.add_node("draft", draft_node)
     graph.add_edge(START, "metadata")
     graph.add_edge("metadata", "retrieval")
     graph.add_edge("retrieval", "rag")
-    graph.add_edge("rag", "synthesis")
-    graph.add_edge("synthesis", "ref_report")
-    graph.add_edge("ref_report", END)
+    graph.add_edge("rag", "draft")
+    graph.add_edge("draft", END)
     return graph.compile()
 
 
 analysis_graph = build_graph()
 
 
-async def analyze_paper(query: str):
+async def analyze_paper(query: str, fields: list[str] | None = None):
+    """Run the pipeline up to candidate-sentence drafting (no final summary).
+    Returns evidence + candidate sentences plus everything compose_summary needs."""
     normalized = normalize_query(query)
     state = await analysis_graph.ainvoke(
         {
@@ -1336,24 +1511,86 @@ async def analyze_paper(query: str):
             "limitations": [],
             "ref_report": "",
             "validation_report": {},
+            "routing_fields": fields or [],
+            "routing_metadata": {},
+            "references": [],
+            "candidates": [],
         }
     )
     return {
         "metadata": state["metadata"],
-        "summary": state["summary"],
-        "sections": state["sections"],
         "evidence": state["evidence"][:32],
+        "candidates": state.get("candidates", []),
         "agent_statuses": state["statuses"],
         "logs": state["logs"],
-        "faithfulness_score": state["faithfulness"],
         "citation_count": state["citation_count"],
         "topics": state["topics"],
-        "model_provider": state["model_provider"],
-        "rag_context_count": len(state["rag_contexts"]),
-        "guardrail_status": state["guardrail_status"],
-        "limitations": state["limitations"],
-        "ref_report": state.get("ref_report", ""),
-        "validation_report": state.get("validation_report", {}),
+        "rag_contexts": state.get("rag_contexts", []),
+        "rag_context_count": len(state.get("rag_contexts", [])),
+        "routing": state.get("routing_metadata", {}),
+    }
+
+
+def compose_summary(
+    metadata: "PaperMetadata",
+    citation_count: int,
+    topics: list[str],
+    selected_evidence: list[EvidenceItem],
+    sentences: list[str],
+    rag_contexts: list[str],
+) -> dict:
+    """Stage 2 (after human curation): weave the reviewer-approved sentences
+    into the final REF summary, then validate it. Mirrors synthesize() outputs."""
+    logs = [log("Synthesis", "Composing summary from reviewer-approved sentences", approved=len(sentences))]
+    references = build_references(selected_evidence, exclude_doi=metadata.doi, exclude_title=metadata.title)
+
+    woven, model_provider, compose_logs = hf_synthesizer.compose(metadata, citation_count, sentences, references)
+    logs.extend(compose_logs)
+    summary = woven or " ".join(sentences) or "No sentences were selected for the summary."
+
+    code_count = len([e for e in selected_evidence if e.kind == "code"])
+    patent_count = len([e for e in selected_evidence if e.kind == "patent"])
+    downstream_count = len([e for e in selected_evidence if e.kind == "downstream"])
+    sections = [
+        ImpactSection(title="Reviewer-curated impact",
+                      body=f"This narrative was composed from {len(sentences)} reviewer-approved, evidence-grounded sentences, spanning {downstream_count} downstream adopter(s), {patent_count} patent(s), and {code_count} code adoption(s)."),
+        ImpactSection(title="Citation reach",
+                      body=f"The paper carries {citation_count:,} citations. " + (f"Detected topics include {', '.join(topics[:5])}." if topics else "No topic labels were available.")),
+    ]
+
+    slm_faith, judge_logs = hf_synthesizer.evaluate_faithfulness(summary, selected_evidence, rag_contexts)
+    logs.extend(judge_logs)
+    faithfulness = slm_faith if slm_faith >= 0.0 else score_faithfulness(summary, selected_evidence, rag_contexts, citation_count, topics)
+
+    validation_report, val_logs = hf_synthesizer.cross_validate_summary(summary, selected_evidence, citation_count, metadata)
+    logs.extend(val_logs)
+
+    ref_report, ref_logs = hf_synthesizer.generate_ref_report(metadata, selected_evidence, summary, topics)
+    logs.extend(ref_logs)
+    if not ref_report:
+        ref_report = summary
+
+    guardrail_status = "passed" if faithfulness >= 0.75 else "review"
+    limitations = []
+    if not selected_evidence:
+        limitations.append("No evidence sentences were selected.")
+    if model_provider == "deterministic":
+        limitations.append("AI narrative unavailable. Add GROQ_API_KEY or GOOGLE_API_KEY to backend/.env.")
+    logs.append(log("Guardrail", "Faithfulness guardrail evaluated composed summary", faithfulness_score=faithfulness, status=guardrail_status))
+
+    return {
+        "summary": summary,
+        "sections": [s.model_dump() if hasattr(s, "model_dump") else s for s in sections],
+        "faithfulness_score": faithfulness,
+        "citation_count": citation_count,
+        "topics": topics,
+        "model_provider": model_provider,
+        "guardrail_status": guardrail_status,
+        "limitations": limitations,
+        "ref_report": ref_report,
+        "validation_report": validation_report,
+        "references": references,
+        "logs": logs,
     }
 
 

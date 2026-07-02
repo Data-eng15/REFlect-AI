@@ -9,5 +9,5 @@ test('renders app successfully', () => {
       <LandingPage />
     </MemoryRouter>
   );
-  expect(screen.getByText(/Veritrace/i)).toBeInTheDocument();
+  expect(screen.getAllByText(/REFlect/i).length).toBeGreaterThan(0);
 });

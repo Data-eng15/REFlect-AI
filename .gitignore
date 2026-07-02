@@ -35,3 +35,6 @@ frontend/dist/
 
 # Claude session data
 .claude/
+
+# Build artifacts
+*.tsbuildinfo

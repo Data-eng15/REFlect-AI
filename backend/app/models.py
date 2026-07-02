@@ -16,6 +16,7 @@ class AgentState(str, Enum):
 
 class AnalyzeRequest(BaseModel):
     query: str = Field(min_length=2, max_length=500)
+    fields: list[str] = Field(default_factory=list, max_length=12)
 
 
 class AgentStatus(BaseModel):

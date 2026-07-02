@@ -21,6 +21,13 @@ import {
   Search,
   ShieldCheck,
   Sparkles,
+  Settings,
+  User,
+  Mail,
+  Building2,
+  Linkedin,
+  TrendingUp,
+  X,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "./AuthContext";
@@ -110,6 +117,42 @@ type AnalyzeResponse = {
   ref_report: string;
   validation_report?: ValidationReport;
   access?: AccessCheck;
+  routing?: RoutingMeta;
+  references?: Reference[];
+};
+
+type Reference = { n: number; label: string; url: string | null; kind: string; note?: string | null };
+
+type Candidate = { id: number; text: string; kind: string; source: string; title: string; url: string | null; year: number | null; citations: number | null };
+type DraftResponse = {
+  draft_id: string; stage: string; metadata: PaperMetadata;
+  evidence: EvidenceItem[]; candidates: Candidate[]; citation_count: number;
+  agent_statuses: AgentStatus[]; logs: TraceLog[]; topics: string[];
+  routing?: RoutingMeta; access?: AccessCheck;
+};
+
+type RoutingMeta = {
+  reason: string;
+  domains: string[];
+  profile_domains: string[];
+  paper_domains: string[];
+  sources_called: string[];
+  sources_skipped: string[];
+  all_sources: string[];
+  fallback_triggered: boolean;
+  evidence_count: number;
+  saved_calls: number;
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  semantic_scholar: "Semantic Scholar",
+  openalex_fallback: "OpenAlex",
+  openalex_enrichment: "OpenAlex Enrich",
+  github: "GitHub",
+  patents: "Google Patents",
+  pubmed: "PubMed",
+  clinical_trials: "ClinicalTrials",
+  soft_sciences: "Policy / UKRI",
 };
 
 type SiteStats = {
@@ -212,7 +255,8 @@ const INITIAL_STATUSES: AgentStatus[] = [
 ];
 
 const EVIDENCE_FILTERS = [
-  { key: "all",       label: "All" },
+  { key: "all",        label: "All" },
+  { key: "downstream", label: "Downstream impact" },
   { key: "citation",  label: "Citations" },
   { key: "code",      label: "Code" },
   { key: "patent",    label: "Patents" },
@@ -226,14 +270,15 @@ const EVIDENCE_FILTERS = [
 
 /** Render **bold** markdown spans inside a string as <strong> elements. */
 function BoldText({ text }: { text: string }) {
-  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  // Split on **bold** and [n] citation markers, styling each.
+  const parts = text.split(/(\*\*[^*]+\*\*|\[\d+\])/g);
   return (
     <>
-      {parts.map((part, i) =>
-        part.startsWith("**") && part.endsWith("**")
-          ? <strong key={i}>{part.slice(2, -2)}</strong>
-          : <span key={i}>{part}</span>
-      )}
+      {parts.map((part, i) => {
+        if (part.startsWith("**") && part.endsWith("**")) return <strong key={i}>{part.slice(2, -2)}</strong>;
+        if (/^\[\d+\]$/.test(part)) return <sup key={i} className="ref-marker">{part}</sup>;
+        return <span key={i}>{part}</span>;
+      })}
     </>
   );
 }
@@ -340,12 +385,113 @@ function withActiveStatuses(statuses: AgentStatus[]): AgentStatus[] {
 
 function Logo() {
   return (
-    <div className="il-logo">
-      <span className="il-logo-mark" style={{ fontSize: 24 }}>
-        i<span className="il-logo-dot" style={{ width: 4, height: 4 }} />l
+    <div className="rf-logo">
+      <span className="rf-logo-mark" style={{ fontSize: 24 }}>
+        R<span className="rf-logo-dot" />
       </span>
-      <span className="il-logo-wordmark" style={{ fontSize: 13 }}>Impact Lab</span>
+      <span className="rf-logo-wordmark" style={{ fontSize: 13 }}>REFlect<span className="rf-logo-ai"> AI</span></span>
     </div>
+  );
+}
+
+type ProfileForm = {
+  first: string; last: string; role: string; affil: string;
+  email: string; orcid: string; linkedin: string; scholar: string;
+};
+
+function ProfileDrawer({
+  open, onClose, seed, onLogout, onSaved, extra,
+}: {
+  open: boolean; onClose: () => void; seed: ProfileForm;
+  onLogout: () => void; onSaved: () => void;
+  extra?: { summary?: string; provider?: string; stats?: { label: string; value: string }[]; fields?: string[] };
+}) {
+  const [form, setForm] = useState<ProfileForm>(seed);
+  useEffect(() => { setForm(seed); }, [seed, open]);
+  if (!open) return null;
+  const set = (k: keyof ProfileForm) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setForm(prev => ({ ...prev, [k]: e.target.value }));
+  const initials = `${(form.first[0] ?? "").toUpperCase()}${(form.last[0] ?? "").toUpperCase()}` || "R";
+  const field = (label: string, k: keyof ProfileForm, icon?: React.ReactNode, optional?: boolean, mono?: boolean) => (
+    <label className="rf-field">
+      <span className="rf-field-label">{label}{optional && <span className="rf-field-optional">optional</span>}</span>
+      <div className="rf-field-input">
+        {icon}
+        <input value={form[k]} onChange={set(k)} style={mono ? { fontFamily: "var(--font-mono)" } : undefined} />
+      </div>
+    </label>
+  );
+  return (
+    <>
+      <div onClick={onClose} className="rf-scrim" />
+      <div className="rf-drawer">
+        <div className="rf-drawer-head">
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <User size={18} /><h3 className="rf-drawer-title">Your profile</h3>
+          </div>
+          <button onClick={onClose} aria-label="Close" className="rf-icon-btn"><X size={18} /></button>
+        </div>
+
+        <div className="rf-drawer-body">
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <div className="rf-avatar-lg">{initials}</div>
+            <div>
+              <div className="rf-profile-name">{form.first} {form.last}</div>
+              <div className="rf-profile-role">{form.role}</div>
+            </div>
+          </div>
+
+          {extra?.stats && extra.stats.length > 0 && (
+            <div className="rf-stat-grid">
+              {extra.stats.map(s => (
+                <div key={s.label} className="rf-stat-cell">
+                  <div className="rf-stat-value">{s.value}</div>
+                  <div className="rf-stat-label">{s.label}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {extra?.summary && (
+            <div className="rf-profile-summary">
+              <div className="rf-profile-summary-head">
+                <span className="rf-field-label" style={{ letterSpacing: "0.08em", textTransform: "uppercase", fontSize: 11 }}>AI profile summary</span>
+                {extra.provider && <span className="rf-provider-chip">{extra.provider.split(":")[0]}</span>}
+              </div>
+              <p className="rf-profile-summary-text">{extra.summary}</p>
+            </div>
+          )}
+
+          {extra?.fields && extra.fields.length > 0 && (
+            <div>
+              <div className="rf-field-label" style={{ marginBottom: 8 }}>Research fields</div>
+              <div className="rf-field-chips">
+                {extra.fields.map(f => <span key={f} className="rf-field-chip">{f}</span>)}
+              </div>
+            </div>
+          )}
+
+          <div className="rf-field-grid">
+            {field("Name", "first")}
+            {field("Surname", "last")}
+          </div>
+          {field("Role / title", "role")}
+          {field("Affiliation", "affil", <Building2 size={16} />)}
+          {field("Email", "email", <Mail size={16} />)}
+          {field("ORCID iD", "orcid", <ShieldCheck size={16} />, false, true)}
+          {field("LinkedIn", "linkedin", <Linkedin size={16} />, true)}
+          {field("Google Scholar", "scholar", <GraduationCap size={16} />, true)}
+        </div>
+
+        <div className="rf-drawer-foot">
+          <button onClick={onLogout} className="rf-signout"><LogOut size={16} /> Sign out</button>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" onClick={onSaved}>Save changes</button>
+          </div>
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -527,6 +673,23 @@ function OverviewTab({
         <div className="summary-block">
           <p className="summary-text"><BoldText text={result.summary} /></p>
         </div>
+
+        {result.references && result.references.length > 0 && (
+          <div className="ref-list">
+            <div className="eyebrow" style={{ marginBottom: 8 }}>References</div>
+            <ol className="ref-list-ol">
+              {result.references.map(r => (
+                <li key={r.n} className="ref-list-li">
+                  <span className={`ref-kind-dot ref-kind-${r.kind}`} title={r.kind} />
+                  {r.url
+                    ? <a href={r.url.startsWith("http") ? r.url : `https://doi.org/${r.url}`} target="_blank" rel="noreferrer">{r.label}</a>
+                    : <span>{r.label}</span>}
+                  {r.kind === "downstream" && <span className="ref-downstream-tag">downstream impact</span>}
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
 
         {result.validation_report && Object.keys(result.validation_report).length > 0 && (
           <PeerReviewCard report={result.validation_report} />
@@ -818,7 +981,7 @@ function EvalTab({ result, loading, error }: {
 
   // Columns to render (skip any baseline the backend didn't return)
   const cols: { key: string; label: string; side: EvalSide | null }[] = [
-    { key: "ag",    label: ag.label ?? "Veritrace (semantic RAG)", side: ag },
+    { key: "ag",    label: ag.label ?? "REFlect AI (semantic RAG)", side: ag },
     { key: "naive", label: naive?.label ?? "Naive multi-source RAG", side: naive },
     { key: "cross", label: cross?.label ?? "CrossRef-only (no RAG)", side: cross },
   ].filter(c => c.side);
@@ -1077,6 +1240,171 @@ function CandidatePicker({ candidates, onPick }: {
 
 type ActiveTab = "overview" | "evidence" | "ref" | "logs" | "eval" | "betaref";
 
+type TopPaper = { title: string; year: number | null; citations: number; venue: string | null; doi: string | null };
+type ResearcherProfile = {
+  source: string; orcid: string; name: string; first: string; last: string;
+  affiliation: string | null; fields: string[]; works_count: number;
+  total_citations: number; h_index: number; i10_index: number;
+  top_papers: TopPaper[]; profile_summary: string; summary_provider: string;
+};
+
+const DEMO_ORCID = import.meta.env.VITE_DEMO_ORCID || "0000-0002-9322-3515";
+
+const PIPELINE_STEPS: { label: string; caption: string; icon: React.ReactNode }[] = [
+  { label: "Supervisor", caption: "Orchestrating the multi-agent pipeline", icon: <BrainCircuit size={24} /> },
+  { label: "Metadata",   caption: "Resolving the paper across Crossref, OpenAlex & Semantic Scholar", icon: <FileText size={24} /> },
+  { label: "Routing",    caption: "Selecting the field-relevant evidence sources", icon: <Database size={24} /> },
+  { label: "Citations",  caption: "Tracing forward citations & downstream impact", icon: <TrendingUp size={24} /> },
+  { label: "Evidence",   caption: "Gathering patents, code, clinical & policy signals", icon: <Landmark size={24} /> },
+  { label: "Adoption",   caption: "Searching GitHub for real-world implementations", icon: <Code2 size={24} /> },
+  { label: "RAG",        caption: "Embedding the evidence into the vector store", icon: <Sparkles size={24} /> },
+  { label: "Validation", caption: "Scoring faithfulness against the evidence", icon: <ShieldCheck size={24} /> },
+  { label: "Synthesis",  caption: "Writing the REF-grade impact narrative", icon: <Search size={24} /> },
+];
+
+function AnalysisProgress() {
+  const [step, setStep] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  const N = PIPELINE_STEPS.length;
+  useEffect(() => {
+    // Simulated progression: advance through stages, holding on the final one
+    // until the real result arrives (this component then unmounts).
+    const timers: number[] = [];
+    let i = 0;
+    const tick = () => {
+      i = Math.min(i + 1, N - 1);
+      setStep(i);
+      if (i < N - 1) timers.push(window.setTimeout(tick, 2100 + Math.random() * 1000));
+    };
+    timers.push(window.setTimeout(tick, 1300));
+    const sec = window.setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => { timers.forEach(clearTimeout); clearInterval(sec); };
+  }, [N]);
+  const cur = PIPELINE_STEPS[step];
+  const pct = Math.round(((step + 0.5) / N) * 100);
+  return (
+    <div className="rf-prog">
+      <div className="rf-prog-rail">
+        <div className="rf-prog-rail-line"><div className="rf-prog-rail-fill" style={{ width: `${(step / (N - 1)) * 100}%` }} /></div>
+        {PIPELINE_STEPS.map((s, i) => (
+          <div key={i} className={`rf-prog-dot ${i < step ? "done" : i === step ? "active" : "pending"}`} title={s.label}>
+            {i < step ? <Check size={11} strokeWidth={3} /> : <span className="rf-prog-dot-core" />}
+          </div>
+        ))}
+      </div>
+
+      <div className="rf-prog-stage">
+        <div className="rf-prog-orb">
+          <span className="rf-prog-orb-ring" />
+          <span className="rf-prog-orb-ring rf-prog-orb-ring2" />
+          <span className="rf-prog-orb-icon">{cur.icon}</span>
+        </div>
+        <div className="rf-prog-now" key={step}>
+          <div className="rf-prog-eyebrow">Stage {step + 1} of {N} · {cur.label}</div>
+          <div className="rf-prog-caption">{cur.caption}</div>
+        </div>
+      </div>
+
+      <div className="rf-prog-bar"><div className="rf-prog-bar-fill" style={{ width: `${pct}%` }} /></div>
+      <div className="rf-prog-meta">
+        <span className="rf-prog-pct">{pct}%</span>
+        <span className="rf-prog-elapsed"><span className="rf-prog-live" /> Analysing impact · {elapsed}s</span>
+      </div>
+    </div>
+  );
+}
+
+const CURATE_KIND_LABEL: Record<string, string> = {
+  downstream: "Downstream impact", citation: "Citation", patent: "Patent", code: "Code",
+  funding: "Funding", policy: "Policy", grant: "Grant", full_text: "Full text",
+};
+
+function CurationView({ draft, selected, onToggle, onAll, onClear, onCompose, composing }: {
+  draft: DraftResponse; selected: Set<number>;
+  onToggle: (id: number) => void; onAll: () => void; onClear: () => void; onCompose: () => void; composing: boolean;
+}) {
+  const cands = draft.candidates;
+  const n = selected.size;
+  return (
+    <div className="curate">
+      <div className="eyebrow">Human-in-the-loop · evidence review</div>
+      <h2 className="curate-title">Select the evidence sentences to include</h2>
+      <p className="curate-sub">
+        REFlect AI gathered the evidence and drafted one grounded sentence per item. Choose the ones you want —
+        the final REF summary is composed <em>only</em> from your selection. Nothing is invented beyond these sentences.
+      </p>
+
+      <div className="curate-toolbar">
+        <div className="curate-count"><strong>{n}</strong> of {cands.length} selected</div>
+        <div className="curate-actions">
+          <button className="btn btn-secondary" onClick={onAll}>Select all</button>
+          <button className="btn btn-secondary" onClick={onClear}>Clear</button>
+          <button className="btn btn-primary" disabled={n === 0 || composing} onClick={onCompose}>
+            {composing ? <><Loader2 size={14} className="spin" /> Composing…</> : <><Sparkles size={14} /> Generate summary · {n}</>}
+          </button>
+        </div>
+      </div>
+
+      <div className="curate-list">
+        {cands.length === 0 && <div className="curate-empty">No evidence sentences were drafted for this paper.</div>}
+        {cands.map(c => {
+          const on = selected.has(c.id);
+          return (
+            <button key={c.id} type="button" className={`curate-item${on ? " on" : ""}`} onClick={() => onToggle(c.id)}>
+              <span className={`curate-check${on ? " on" : ""}`}>{on && <Check size={13} strokeWidth={3} />}</span>
+              <span className="curate-body">
+                <span className="curate-text">{c.text}</span>
+                <span className="curate-meta">
+                  <span className={`curate-kind kind-${c.kind}`}>{CURATE_KIND_LABEL[c.kind] ?? c.kind}</span>
+                  <span className="curate-src">{c.source}{c.citations ? ` · ${c.citations.toLocaleString()} citations` : ""}</span>
+                  {c.url && (
+                    <a href={c.url.startsWith("http") ? c.url : `https://doi.org/${c.url}`} target="_blank" rel="noreferrer"
+                       onClick={e => e.stopPropagation()} className="curate-link"><ExternalLink size={12} /></a>
+                  )}
+                </span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function RoutingPanel({ routing }: { routing: RoutingMeta }) {
+  if (!routing?.sources_called?.length) return null;
+  const total = routing.all_sources.length;
+  return (
+    <div className="rf-routing">
+      <div className="rf-routing-head">
+        <span className="rf-routing-title"><Database size={14} /> Dynamic source routing</span>
+        <span className="rf-routing-count">
+          {routing.sources_called.length}/{total} sources queried · {routing.saved_calls} skipped
+        </span>
+      </div>
+      <div className="rf-routing-domains">
+        {routing.domains.length
+          ? routing.domains.map(d => <span key={d} className="rf-domain-chip">{d.replace(/_/g, " ")}</span>)
+          : <span className="rf-domain-chip muted">no clear domain — full scan</span>}
+        <span className="rf-routing-reason" title="Why these sources were chosen">routed by: {routing.reason}</span>
+      </div>
+      <div className="rf-routing-sources">
+        {routing.sources_called.map(s => (
+          <span key={s} className="rf-src on"><Check size={11} /> {SOURCE_LABELS[s] || s}</span>
+        ))}
+        {routing.sources_skipped.map(s => (
+          <span key={s} className="rf-src off">{SOURCE_LABELS[s] || s}</span>
+        ))}
+      </div>
+      {routing.fallback_triggered && (
+        <div className="rf-routing-fallback">
+          ↻ Recall fallback: widened to all sources (routed pass returned too little evidence)
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const navigate = useNavigate();
   const { user, logout } = useAuth();
@@ -1084,6 +1412,10 @@ export default function Dashboard() {
   const [query, setQuery]             = useState(SAMPLE_QUERIES[0]);
   const [result, setResult]           = useState<AnalyzeResponse | null>(null);
   const [loading, setLoading]         = useState(false);
+  const [draft, setDraft]             = useState<DraftResponse | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [composing, setComposing]     = useState(false);
+  const [lastQuery, setLastQuery]     = useState<string>("");
   const [error, setError]             = useState<string | null>(null);
   const [activeTab, setActiveTab]     = useState<ActiveTab>("overview");
   const [evidenceFilter, setEvidenceFilter] = useState("all");
@@ -1101,10 +1433,15 @@ export default function Dashboard() {
   const [evalLoading, setEvalLoading] = useState(false);
   const [evalError, setEvalError]     = useState<string | null>(null);
   const [candidates, setCandidates]   = useState<SearchCandidate[]>([]);
+  const [searchWarning, setSearchWarning] = useState<string | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [betaRef, setBetaRef]         = useState<BetaRefResult | null>(null);
   const [betaLoading, setBetaLoading] = useState(false);
   const [betaError, setBetaError]     = useState<string | null>(null);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [toast, setToast]             = useState<string | null>(null);
+  const [profile, setProfile]         = useState<ResearcherProfile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(true);
 
   // Load stats
   useEffect(() => {
@@ -1125,8 +1462,8 @@ export default function Dashboard() {
   // Document title
   useEffect(() => {
     document.title = result?.metadata?.title
-      ? `${result.metadata.title} — Veritrace`
-      : "Veritrace — Research Impact Analyser";
+      ? `${result.metadata.title} — REFlect AI`
+      : "REFlect AI — Research Impact Analyser";
   }, [result]);
 
   function updateHistory(q: string) {
@@ -1141,37 +1478,26 @@ export default function Dashboard() {
   }
 
   async function runAnalyze(resolvedQuery: string) {
-    const cacheKey = `vt_cache_${resolvedQuery}`;
-    const cached = localStorage.getItem(cacheKey);
-    if (cached) {
-      try {
-        const data = JSON.parse(cached) as AnalyzeResponse;
-        setResult(data); setActiveTab("overview");
-        updateHistory(resolvedQuery);
-        // auto-eval in background
-        runEval(resolvedQuery, true);
-        return;
-      } catch {}
-    }
-
-    setLoading(true); setError(null); setResult(null);
+    const routingFields = profile?.fields ?? [];
+    setLoading(true); setError(null); setResult(null); setDraft(null);
     setBetaRef(null); setBetaError(null); setEvalResult(null); setEvalError(null);
+    setLastQuery(resolvedQuery);
 
     try {
       const headers = { "Content-Type": "application/json", ...(await getAuthHeader()) };
+      // Stage 1 — gather evidence + draft candidate sentences for curation.
       const resp = await fetch(`${API_URL}/api/analyze`, {
-        method: "POST", headers, body: JSON.stringify({ query: resolvedQuery }),
+        method: "POST", headers, body: JSON.stringify({ query: resolvedQuery, fields: routingFields }),
       });
       if (!resp.ok) {
         const body = await resp.json().catch(() => ({}));
         throw new Error(body.detail ?? `API ${resp.status}`);
       }
-      const data = await resp.json() as AnalyzeResponse;
-      setResult(data); setActiveTab("overview");
-      localStorage.setItem(cacheKey, JSON.stringify(data));
+      const data = await resp.json() as DraftResponse;
+      setDraft(data);
+      setSelectedIds(new Set(data.candidates.map(c => c.id)));  // default: all selected
+      setActiveTab("overview");
       updateHistory(resolvedQuery);
-      // auto-eval in background
-      runEval(resolvedQuery, true);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Analysis failed");
     } finally {
@@ -1179,12 +1505,40 @@ export default function Dashboard() {
     }
   }
 
-  async function analyze(event?: FormEvent, q?: string) {
+  // Stage 2 — weave the reviewer-approved sentences into the final summary.
+  async function composeSummary() {
+    if (!draft || selectedIds.size === 0) return;
+    setComposing(true); setError(null);
+    try {
+      const headers = { "Content-Type": "application/json", ...(await getAuthHeader()) };
+      const resp = await fetch(`${API_URL}/api/compose`, {
+        method: "POST", headers,
+        body: JSON.stringify({ draft_id: draft.draft_id, selected_ids: [...selectedIds] }),
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail ?? `API ${resp.status}`);
+      }
+      const data = await resp.json() as AnalyzeResponse;
+      setResult(data); setActiveTab("overview");
+      if (lastQuery) runEval(lastQuery, true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Compose failed");
+    } finally {
+      setComposing(false);
+    }
+  }
+
+  const toggleSentence = (id: number) =>
+    setSelectedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  async function analyze(event?: FormEvent, q?: string, retried = false) {
     event?.preventDefault();
     const searchQuery = (q ?? query).trim();
     if (!searchQuery) return;
     setQuery(searchQuery);
     setCandidates([]);
+    setSearchWarning(null);
 
     // Detect if DOI / arXiv → go direct
     const isDirectId = /^10\.\d{4,9}\//.test(searchQuery) || /^\d{4}\.\d{4,5}/.test(searchQuery);
@@ -1196,10 +1550,20 @@ export default function Dashboard() {
       const resp = await fetch(`${API_URL}/api/search?q=${encodeURIComponent(searchQuery)}`);
       const data = await resp.json();
       const cands: SearchCandidate[] = data.candidates ?? [];
-      if (cands.length === 1) {
-        const c = cands[0];
-        await runAnalyze(c.doi ?? c.title);
-      } else if (cands.length > 1) {
+      // Low confidence = Semantic Scholar (the only reliable canonical source)
+      // was unavailable. Retry once after a short backoff before showing results.
+      if (data.low_confidence && !retried) {
+        await new Promise(r => setTimeout(r, 1600));
+        setSearchLoading(false);
+        return analyze(undefined, searchQuery, true);
+      }
+      const warn = !!data.low_confidence;
+      if (cands.length === 1 && !warn) {
+        await runAnalyze(cands[0].doi ?? cands[0].title);
+      } else if (cands.length >= 1) {
+        // When low-confidence, always show the picker (never auto-run a paper
+        // that might be the wrong "canonical" one) and warn the user.
+        if (warn) setSearchWarning("The citation index (Semantic Scholar) was briefly unavailable, so the canonical highest-cited paper may be missing from this list. Choose carefully, or re-run the search in a moment.");
         setCandidates(cands);
       } else {
         await runAnalyze(searchQuery);
@@ -1280,6 +1644,60 @@ export default function Dashboard() {
     ? withActiveStatuses(INITIAL_STATUSES)
     : (result?.agent_statuses ?? INITIAL_STATUSES);
 
+  // ── Personalised profile (ORCID/OpenAlex) ────────────────
+  const manual = useMemo(() => {
+    try { return JSON.parse(sessionStorage.getItem("rf_manual") || "null"); }
+    catch { return null; }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setProfileLoading(true);
+      let qs: string;
+      if (user?.orcid) {
+        qs = `orcid=${encodeURIComponent(user.orcid)}`;
+      } else if (manual?.name) {
+        const parts = [`name=${encodeURIComponent(manual.name)}`];
+        if (manual.affiliation) parts.push(`affiliation=${encodeURIComponent(manual.affiliation)}`);
+        qs = parts.join("&");
+      } else {
+        qs = `orcid=${DEMO_ORCID}`;
+      }
+      try {
+        const res = await fetch(`${API_URL}/api/profile?${qs}`).then(r => r.json());
+        if (!cancelled) setProfile(res?.resolved ? res.profile : null);
+      } catch {
+        if (!cancelled) setProfile(null);
+      } finally {
+        if (!cancelled) setProfileLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [user?.orcid, manual]);
+
+  const firstName = profile?.first || user?.displayName?.split(/\s+/)[0] || manual?.first || "Researcher";
+  const lastName = profile?.last || user?.displayName?.split(/\s+/).slice(1).join(" ") || manual?.last || "";
+  const greetLast = lastName || firstName;
+  const profileSeed: ProfileForm = {
+    first: firstName,
+    last: lastName,
+    role: profile?.fields?.[0] ? `Researcher · ${profile.fields[0]}` : "Researcher",
+    affil: profile?.affiliation || manual?.affiliation || "—",
+    email: user?.email || manual?.email || "—",
+    orcid: profile?.orcid || user?.orcid || manual?.orcid || "—",
+    linkedin: manual?.linkedin || "—",
+    scholar: manual?.scholar || "—",
+  };
+  const [returning] = useState(() => localStorage.getItem("rf_seen") === "1");
+  useEffect(() => { localStorage.setItem("rf_seen", "1"); }, []);
+
+  function saveProfile() {
+    setProfileOpen(false);
+    setToast("Profile updated");
+    setTimeout(() => setToast(null), 2400);
+  }
+
   return (
     <main className="app-shell">
       {/* ── Sidebar ────────────────────────────────────────── */}
@@ -1288,16 +1706,41 @@ export default function Dashboard() {
 
         <div className="sidebar-section">
           <div className="sidebar-section-header">
-            <Clock size={13} />
-            <div className="eyebrow">Recent queries</div>
+            <TrendingUp size={13} />
+            <div className="eyebrow">Your top papers</div>
           </div>
-          <div className="sidebar-history-list">
-            {(history.length ? history : SAMPLE_QUERIES).map(item => (
-              <button key={item} className="sidebar-history-item" onClick={() => analyze(undefined, item)}>
-                {item}
-              </button>
-            ))}
-          </div>
+          {profileLoading ? (
+            <div className="rf-toppapers-loading">
+              <Loader2 size={13} className="spin" /> Building your profile…
+            </div>
+          ) : (profile?.top_papers?.length ? (
+            <div className="rf-toppapers">
+              {profile.top_papers.slice(0, 6).map((p, i) => (
+                <button
+                  key={(p.doi ?? p.title) + i}
+                  className="rf-toppaper"
+                  onClick={() => analyze(undefined, p.doi || p.title)}
+                  title={p.title}
+                >
+                  <span className="rf-toppaper-rank">{i + 1}</span>
+                  <span className="rf-toppaper-body">
+                    <span className="rf-toppaper-title">{p.title}</span>
+                    <span className="rf-toppaper-meta">
+                      {p.citations.toLocaleString()} citations{p.year ? ` · ${p.year}` : ""}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="sidebar-history-list">
+              {(history.length ? history : SAMPLE_QUERIES).map(item => (
+                <button key={item} className="sidebar-history-item" onClick={() => analyze(undefined, item)}>
+                  {item}
+                </button>
+              ))}
+            </div>
+          ))}
         </div>
 
         <div className="sidebar-section">
@@ -1333,21 +1776,49 @@ export default function Dashboard() {
         </div>
 
         <div className="sidebar-user" style={{ marginTop: "auto" }}>
-          <div className="sidebar-avatar">
-            {user?.photoURL
-              ? <img src={user.photoURL} alt="" style={{ width: "100%", height: "100%", borderRadius: "50%" }} />
-              : (user?.displayName ?? user?.email ?? "D")[0].toUpperCase()
-            }
-          </div>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div className="sidebar-user-name">{user?.displayName ?? "Researcher"}</div>
-            <div className="sidebar-user-email">{user?.email ?? "Demo mode"}</div>
-          </div>
+          <button
+            className="sidebar-user-main"
+            onClick={() => setProfileOpen(true)}
+            title="View and edit your profile"
+          >
+            <div className="sidebar-avatar">
+              {user?.photoURL
+                ? <img src={user.photoURL} alt="" style={{ width: "100%", height: "100%", borderRadius: "50%" }} />
+                : `${(firstName[0] ?? "R")}${(lastName[0] ?? "")}`.toUpperCase()
+              }
+            </div>
+            <div style={{ flex: 1, minWidth: 0, textAlign: "left" }}>
+              <div className="sidebar-user-name">{profile ? `${firstName} ${lastName}`.trim() : (user?.displayName ?? "Researcher")}</div>
+              <div className="sidebar-user-email">{profile?.affiliation ?? user?.email ?? "Demo mode"}</div>
+            </div>
+            <Settings size={15} style={{ color: "var(--fg-3)", flexShrink: 0 }} />
+          </button>
           <button className="sidebar-logout" onClick={handleLogout} title="Sign out">
             <LogOut size={15} />
           </button>
         </div>
       </aside>
+
+      <ProfileDrawer
+        open={profileOpen}
+        onClose={() => setProfileOpen(false)}
+        seed={profileSeed}
+        onLogout={handleLogout}
+        onSaved={saveProfile}
+        extra={profile ? {
+          summary: profile.profile_summary,
+          provider: profile.summary_provider,
+          fields: profile.fields,
+          stats: [
+            { label: "h-index", value: String(profile.h_index) },
+            { label: "Citations", value: profile.total_citations.toLocaleString() },
+            { label: "Works", value: profile.works_count.toLocaleString() },
+            { label: "i10-index", value: String(profile.i10_index) },
+          ],
+        } : undefined}
+      />
+
+      {toast && <div className="rf-toast"><Check size={15} /> {toast}</div>}
 
       {/* ── Workspace ──────────────────────────────────────── */}
       <section className="workspace">
@@ -1459,10 +1930,16 @@ export default function Dashboard() {
 
         {/* Candidate picker */}
         {candidates.length > 0 && (
-          <div className="candidate-picker-overlay" onClick={e => e.target === e.currentTarget && setCandidates([])}>
+          <div className="candidate-picker-overlay" onClick={e => e.target === e.currentTarget && (setCandidates([]), setSearchWarning(null))}>
             <div className="candidate-picker-sheet">
               <div className="candidate-picker-title">Multiple papers found — select one to analyse</div>
-              <div className="candidate-picker-sub">Ranked by citation impact — the highest-impact version is highlighted.</div>
+              <div className="candidate-picker-sub">{searchWarning ? "Listed by citation count from the available sources." : "Ranked by citation impact — the highest-impact version is highlighted."}</div>
+              {searchWarning && (
+                <div className="candidate-picker-warning">
+                  <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <span>{searchWarning}</span>
+                </div>
+              )}
               {candidates.map((c, i) => (
                 <div
                   key={i}
@@ -1502,22 +1979,35 @@ export default function Dashboard() {
 
         {/* Tab content */}
         <div className="tab-content">
-          {!hasResult && !loading && (
+          {!hasResult && !loading && !draft && (
             <div className="empty-state">
-              <BookOpen size={40} className="empty-icon" />
-              <div className="empty-title">Paste a DOI to begin</div>
-              <div className="empty-body">The agent will retrieve metadata, citations, code, patents, and funding signals, then synthesise a concise 100-word impact summary validated by an independent AI peer-reviewer.</div>
+              <div className="rf-greeting-eyebrow">{returning ? "Welcome back" : "Welcome"}</div>
+              <h2 className="rf-greeting">
+                {returning ? "Welcome back, " : "Welcome, "}
+                <span className="rf-greeting-name">Prof. {greetLast}</span>.
+              </h2>
+              <div className="empty-body">
+                Paste a DOI, title, arXiv ID, or BibTeX entry above and REFlect AI will trace its
+                downstream influence — citations, code, patents, policy, and funding — then draft
+                evidence sentences for you to review before composing the REF-ready narrative.
+              </div>
             </div>
           )}
 
-          {loading && !result && (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 24, padding: "48px 40px" }}>
-              <Loader2 size={28} className="spin" style={{ color: "var(--accent)" }} />
-              <div style={{ fontSize: 15, fontWeight: 500, color: "var(--fg-1)" }}>Running 9-agent pipeline…</div>
-              <div style={{ maxWidth: 380, width: "100%" }}>
-                <AgentLogPanel statuses={showStatuses} />
-              </div>
-            </div>
+          {loading && !result && <AnalysisProgress />}
+
+          {draft && !result && !loading && (
+            <CurationView
+              draft={draft} selected={selectedIds} composing={composing}
+              onToggle={toggleSentence}
+              onAll={() => setSelectedIds(new Set(draft.candidates.map(c => c.id)))}
+              onClear={() => setSelectedIds(new Set())}
+              onCompose={composeSummary}
+            />
+          )}
+
+          {result && activeTab === "overview" && result.routing && (
+            <RoutingPanel routing={result.routing} />
           )}
 
           {result && activeTab === "overview" && (

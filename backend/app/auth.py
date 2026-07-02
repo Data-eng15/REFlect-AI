@@ -21,10 +21,13 @@ LINKEDIN_JWT_ALG = "HS256"
 def create_linkedin_token(uid: str, email: str, name: str) -> str:
     return pyjwt.encode({"uid":uid,"email":email,"name":name,"provider":"linkedin"}, LINKEDIN_JWT_SECRET, algorithm=LINKEDIN_JWT_ALG)
 
+def create_orcid_token(uid: str, email: str, name: str, orcid: str = "") -> str:
+    return pyjwt.encode({"uid":uid,"email":email,"name":name,"orcid":orcid,"provider":"orcid"}, LINKEDIN_JWT_SECRET, algorithm=LINKEDIN_JWT_ALG)
+
 def _verify_linkedin_token(token: str) -> Optional[dict]:
     try:
         payload = pyjwt.decode(token, LINKEDIN_JWT_SECRET, algorithms=[LINKEDIN_JWT_ALG])
-        return {"uid": payload.get("uid"), "name": payload.get("name"), "email": payload.get("email")}
+        return {"uid": payload.get("uid"), "name": payload.get("name"), "email": payload.get("email"), "orcid": payload.get("orcid"), "provider": payload.get("provider","linkedin")}
     except Exception:
         return None
 
