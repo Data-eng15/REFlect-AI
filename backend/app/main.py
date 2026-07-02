@@ -45,7 +45,7 @@ allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 # Override with ALLOWED_ORIGIN_REGEX to add/replace a custom Pages domain.
 _origin_regex = os.getenv("ALLOWED_ORIGIN_REGEX", r"https://([a-z0-9-]+\.)*pages\.dev")
 
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_origin_regex=_origin_regex, allow_credentials=True, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type"], max_age=600)
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_origin_regex=_origin_regex, allow_credentials=True, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type","ngrok-skip-browser-warning"], max_age=600)
 
 LINKEDIN_CLIENT_ID     = os.getenv("LINKEDIN_CLIENT_ID","")
 LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET","")
