@@ -101,7 +101,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const loginWithOrcid = async (): Promise<boolean> => {
     let cfg: { configured?: boolean; client_id?: string; authorize_base?: string } = {};
     try {
-      cfg = await fetch(`${API_URL}/api/auth/orcid/config`).then((r) => r.json());
+      cfg = await fetch(`${API_URL}/api/auth/orcid/config`, {
+        headers: { "ngrok-skip-browser-warning": "true" },
+      }).then((r) => r.json());
     } catch {
       cfg = {};
     }
@@ -115,7 +117,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Mock flow
     const data = await fetch(`${API_URL}/api/auth/orcid/exchange`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
       body: JSON.stringify({ code: "mock", redirect_uri: redirectUri }),
     }).then((r) => r.json());
     if (!data?.token) throw new Error("ORCID sign-in failed");

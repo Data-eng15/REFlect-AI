@@ -17,7 +17,7 @@ export default function AuthCallback() {
     const endpoint = isOrcid ? "/api/auth/orcid/exchange" : "/api/auth/linkedin/exchange";
     fetch(`${API_URL}${endpoint}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
       body: JSON.stringify({ code, redirect_uri: `${window.location.origin}/auth/callback` }),
     }).then(r => r.json()).then(data => {
       if (data.token) {

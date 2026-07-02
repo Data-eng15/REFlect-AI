@@ -42,7 +42,12 @@ def rate_limit(request: Request, limit: int = 20, window: int = 60) -> None:
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175")
 allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type"], max_age=600)
+# Cloudflare Pages production + preview subdomains (e.g. https://reflect-ai.pages.dev,
+# https://<hash>.reflect-ai.pages.dev). Regex avoids listing every ephemeral preview URL.
+# Override with ALLOWED_ORIGIN_REGEX to add/replace a custom Pages domain.
+_origin_regex = os.getenv("ALLOWED_ORIGIN_REGEX", r"https://([a-z0-9-]+\.)*pages\.dev")
+
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_origin_regex=_origin_regex, allow_credentials=True, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type","ngrok-skip-browser-warning"], max_age=600)
 
 LINKEDIN_CLIENT_ID     = os.getenv("LINKEDIN_CLIENT_ID","")
 LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET","")

@@ -231,6 +231,11 @@ type BetaRefResult = {
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+// ngrok's free tier serves an HTML interstitial to browser requests unless this
+// header is present. Harmless against non-ngrok backends. Injected on every API call.
+const apiFetch = (input: string, init: RequestInit = {}) =>
+  fetch(input, { ...init, headers: { "ngrok-skip-browser-warning": "true", ...(init.headers || {}) } });
+
 const SAMPLE_QUERIES = [
   "10.1038/nature14539",
   "Attention Is All You Need",
@@ -1445,14 +1450,14 @@ export default function Dashboard() {
 
   // Load stats
   useEffect(() => {
-    fetch(`${API_URL}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
+    apiFetch(`${API_URL}/api/stats`).then(r => r.json()).then(setStats).catch(() => {});
   }, []);
 
   // Load user history from backend if logged in
   useEffect(() => {
     if (!user) return;
     user.getToken().then(token => {
-      fetch(`${API_URL}/api/history`, { headers: { Authorization: `Bearer ${token}` } })
+      apiFetch(`${API_URL}/api/history`, { headers: { Authorization: `Bearer ${token}` } })
         .then(r => r.ok ? r.json() : null)
         .then(data => { if (data?.queries) setHistory(data.queries.slice(0, 10)); })
         .catch(() => {});
@@ -1486,7 +1491,7 @@ export default function Dashboard() {
     try {
       const headers = { "Content-Type": "application/json", ...(await getAuthHeader()) };
       // Stage 1 — gather evidence + draft candidate sentences for curation.
-      const resp = await fetch(`${API_URL}/api/analyze`, {
+      const resp = await apiFetch(`${API_URL}/api/analyze`, {
         method: "POST", headers, body: JSON.stringify({ query: resolvedQuery, fields: routingFields }),
       });
       if (!resp.ok) {
@@ -1511,7 +1516,7 @@ export default function Dashboard() {
     setComposing(true); setError(null);
     try {
       const headers = { "Content-Type": "application/json", ...(await getAuthHeader()) };
-      const resp = await fetch(`${API_URL}/api/compose`, {
+      const resp = await apiFetch(`${API_URL}/api/compose`, {
         method: "POST", headers,
         body: JSON.stringify({ draft_id: draft.draft_id, selected_ids: [...selectedIds] }),
       });
@@ -1547,7 +1552,7 @@ export default function Dashboard() {
     // Title → search first
     setSearchLoading(true);
     try {
-      const resp = await fetch(`${API_URL}/api/search?q=${encodeURIComponent(searchQuery)}`);
+      const resp = await apiFetch(`${API_URL}/api/search?q=${encodeURIComponent(searchQuery)}`);
       const data = await resp.json();
       const cands: SearchCandidate[] = data.candidates ?? [];
       // Low confidence = Semantic Scholar (the only reliable canonical source)
@@ -1582,7 +1587,7 @@ export default function Dashboard() {
     if (!autoMode) setActiveTab("eval");
     try {
       const headers = { "Content-Type": "application/json", ...(await getAuthHeader()) };
-      const resp = await fetch(`${API_URL}/api/evaluate`, {
+      const resp = await apiFetch(`${API_URL}/api/evaluate`, {
         method: "POST", headers, body: JSON.stringify({ query: q }),
       });
       if (!resp.ok) throw new Error(`Eval API ${resp.status}`);
@@ -1613,7 +1618,7 @@ export default function Dashboard() {
           source: e.source, url: e.url, year: e.year, authors: e.authors,
         })),
       };
-      const resp = await fetch(`${API_URL}/api/ref/beta`, {
+      const resp = await apiFetch(`${API_URL}/api/ref/beta`, {
         method: "POST", headers, body: JSON.stringify(body),
       });
       if (!resp.ok) {
@@ -1665,7 +1670,7 @@ export default function Dashboard() {
         qs = `orcid=${DEMO_ORCID}`;
       }
       try {
-        const res = await fetch(`${API_URL}/api/profile?${qs}`).then(r => r.json());
+        const res = await apiFetch(`${API_URL}/api/profile?${qs}`).then(r => r.json());
         if (!cancelled) setProfile(res?.resolved ? res.profile : null);
       } catch {
         if (!cancelled) setProfile(null);

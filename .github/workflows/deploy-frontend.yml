@@ -1,0 +1,49 @@
+name: Deploy frontend to Cloudflare Pages
+
+# Auto-deploys the React/Vite frontend to the existing Cloudflare Pages
+# project "reflect-ai" (https://reflect-ai-a6r.pages.dev) on every push to
+# main that touches the frontend. Can also be run manually from the Actions tab.
+#
+# Requires two repo secrets (Settings -> Secrets and variables -> Actions):
+#   CLOUDFLARE_API_TOKEN   - a token with the "Cloudflare Pages: Edit" permission
+#   CLOUDFLARE_ACCOUNT_ID  - the Cloudflare account id
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        env:
+          # Public backend URL (ngrok tunnel to the VM). Change here if the
+          # backend URL ever changes.
+          VITE_API_URL: https://gravy-cardboard-brigade.ngrok-free.dev
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy frontend/dist --project-name=reflect-ai --branch=main
