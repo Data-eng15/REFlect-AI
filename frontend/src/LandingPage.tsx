@@ -118,99 +118,26 @@ function OrDivider({ children }: { children: React.ReactNode }) {
 
 /* ── Auth cards ───────────────────────────────────────────────────────────── */
 
-function SignInCard({ onOrcid, onCredentials, toSignup }: {
-  onOrcid: () => void; onCredentials: () => void; toSignup: () => void;
-}) {
-  const [u, setU] = useState("");
-  const [p, setP] = useState("");
+function AuthCard({ onOrcid }: { onOrcid: () => void }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 26, lineHeight: "32px", fontWeight: 500, letterSpacing: "-0.01em", color: "var(--ink)" }}>Sign in to REFlect AI</h2>
-        <div style={{ fontSize: 14, color: "var(--fg-2)" }}>Continue to your researcher workspace.</div>
+        <div style={{ fontSize: 14, color: "var(--fg-2)", lineHeight: "22px" }}>
+          Your ORCID iD is your account — it verifies your identity and automatically links your publication record. No separate sign-up or password needed.
+        </div>
       </div>
 
       <ProviderButton icon={<OrcidMark />} accent={ORCID_GREEN} onClick={onOrcid}>Sign in with ORCID iD</ProviderButton>
-      <ProviderButton icon={<Building2 size={16} />} onClick={onCredentials}>Sign in with your institution</ProviderButton>
 
-      <OrDivider>or with credentials</OrDivider>
-
-      <form onSubmit={(e) => { e.preventDefault(); onCredentials(); }} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <Field label="Username" name="username" placeholder="m.okafor" icon={<User size={16} />} value={u} onChange={(e) => setU(e.target.value)} autoFocus />
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <Field label="Password" name="password" type="password" placeholder="••••••••" icon={<Lock size={16} />} value={p} onChange={(e) => setP(e.target.value)} />
-          <a href="#" onClick={(e) => e.preventDefault()} style={{ fontSize: 12, color: "var(--fg-2)", alignSelf: "flex-end" }}>Forgot password?</a>
-        </div>
-        <Button type="submit" size="lg" iconRight={<ArrowRight size={16} />} style={{ width: "100%" }}>Sign in</Button>
-      </form>
-
-      <div style={{ fontSize: 13, color: "var(--fg-2)", textAlign: "center" }}>
-        New researcher?{" "}
-        <a href="#" onClick={(e) => { e.preventDefault(); toSignup(); }} style={{ fontWeight: 500 }}>Create an account</a>
-      </div>
-    </div>
-  );
-}
-
-export type SignupForm = { first: string; last: string; email: string; linkedin: string; scholar: string; affil: string; orcid: string };
-
-function SignUpCard({ onOrcid, onSubmit, toSignin }: {
-  onOrcid: () => void; onSubmit: (form: SignupForm) => void; toSignin: () => void;
-}) {
-  const [manual, setManual] = useState(false);
-  const [f, setF] = useState<SignupForm>({ first: "", last: "", email: "", linkedin: "", scholar: "", affil: "", orcid: "" });
-  const set = (k: keyof SignupForm) => (e: React.ChangeEvent<HTMLInputElement>) => setF((prev) => ({ ...prev, [k]: e.target.value }));
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 26, lineHeight: "32px", fontWeight: 500, letterSpacing: "-0.01em", color: "var(--ink)" }}>Create your account</h2>
-        <div style={{ fontSize: 14, color: "var(--fg-2)" }}>Link your scholarly profiles so REFlect AI can attribute work to you.</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--fg-3)", lineHeight: "18px" }}>
+        <ShieldCheck size={14} />
+        <span>Secure academic sign-in via ORCID — we never see or store a password.</span>
       </div>
 
-      {!manual && (
-        <>
-          <ProviderButton icon={<OrcidMark />} accent={ORCID_GREEN} onClick={onOrcid}>Continue with ORCID iD</ProviderButton>
-          <div style={{ fontSize: 12, color: "var(--fg-2)", textAlign: "center", lineHeight: "18px" }}>
-            ORCID auto-fills your name, affiliation, and publication record.
-          </div>
-          <OrDivider>or enter details</OrDivider>
-        </>
-      )}
-
-      <form onSubmit={(e) => { e.preventDefault(); onSubmit(f); }} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-          <Field label="Name" name="first" placeholder="Maya" value={f.first} onChange={set("first")} />
-          <Field label="Surname" name="last" placeholder="Okafor" value={f.last} onChange={set("last")} />
-        </div>
-        <Field label="Institutional email" name="email" type="email" placeholder="m.okafor@university.edu" icon={<Mail size={16} />} value={f.email} onChange={set("email")} />
-        <Field label="LinkedIn profile" name="linkedin" optional placeholder="linkedin.com/in/maya-okafor" icon={<Linkedin size={16} />} value={f.linkedin} onChange={set("linkedin")} />
-        <Field label="Google Scholar profile" name="scholar" optional placeholder="scholar.google.com/citations?user=…" icon={<GraduationCap size={16} />} value={f.scholar} onChange={set("scholar")} />
-
-        {manual && (
-          <>
-            <Field label="Affiliation" name="affil" placeholder="Dept. of Computer Science, University of Leeds" icon={<Building2 size={16} />} value={f.affil} onChange={set("affil")} />
-            <Field label="ORCID iD" name="orcid" optional placeholder="0000-0002-1825-0097" mono icon={<OrcidMark />} value={f.orcid} onChange={set("orcid")} />
-          </>
-        )}
-
-        <Button type="submit" size="lg" iconRight={<ArrowRight size={16} />} style={{ width: "100%" }}>Create account</Button>
-      </form>
-
-      <button
-        onClick={() => setManual((m) => !m)}
-        style={{
-          display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
-          border: 0, background: "transparent", cursor: "pointer",
-          fontFamily: "var(--font-sans)", fontSize: 13, fontWeight: 500, color: "var(--accent)",
-        }}
-      >
-        {manual ? <ChevronDown size={14} style={{ transform: "rotate(180deg)" }} /> : <Plus size={14} />}
-        {manual ? "Hide manual fields" : "Enter affiliation & ORCID manually"}
-      </button>
-
       <div style={{ fontSize: 13, color: "var(--fg-2)", textAlign: "center" }}>
-        Already registered?{" "}
-        <a href="#" onClick={(e) => { e.preventDefault(); toSignin(); }} style={{ fontWeight: 500 }}>Sign in</a>
+        Don't have an ORCID iD?{" "}
+        <a href="https://orcid.org/register" target="_blank" rel="noreferrer" style={{ fontWeight: 500 }}>Create one free</a> — it takes a minute.
       </div>
     </div>
   );
@@ -221,7 +148,6 @@ function SignUpCard({ onOrcid, onSubmit, toSignin }: {
 export default function LandingPage() {
   const navigate = useNavigate();
   const { loginWithOrcid } = useAuth();
-  const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
 
   const handleOrcid = async () => {
     try {
@@ -231,23 +157,6 @@ export default function LandingPage() {
     } catch (e) {
       console.error("ORCID sign-in failed", e);
     }
-  };
-
-  // Email/password and "institution" login have no backend and are not real
-  // authentication — every sign-in attempt is routed to real ORCID OAuth.
-  const enterDemo = () => { void handleOrcid(); };
-
-  // Manual sign-up keeps the self-declared identity (for name-based profile
-  // resolution), but authentication itself must go through ORCID.
-  const handleSignup = (form: SignupForm) => {
-    const name = `${form.first} ${form.last}`.trim();
-    if (name) {
-      sessionStorage.setItem("rf_manual", JSON.stringify({
-        name, first: form.first, last: form.last, email: form.email,
-        affiliation: form.affil, scholar: form.scholar, linkedin: form.linkedin, orcid: form.orcid,
-      }));
-    }
-    void handleOrcid();
   };
 
   return (
@@ -263,8 +172,7 @@ export default function LandingPage() {
           <a href="#how" style={{ fontSize: 13, fontWeight: 500, color: "var(--fg-2)", textDecoration: "none" }}>How it works</a>
           <a href="#sources" style={{ fontSize: 13, fontWeight: 500, color: "var(--fg-2)", textDecoration: "none" }}>Data sources</a>
           <a href="#" onClick={(e) => e.preventDefault()} style={{ fontSize: 13, fontWeight: 500, color: "var(--fg-2)", textDecoration: "none" }}>Methodology</a>
-          <Button variant="secondary" onClick={() => setAuthMode("signin")}>Sign in</Button>
-          <Button onClick={() => setAuthMode("signup")}>Create account</Button>
+          <Button onClick={handleOrcid}>Sign in with ORCID</Button>
         </nav>
       </header>
 
@@ -304,9 +212,8 @@ export default function LandingPage() {
 
         {/* Auth card */}
         <div style={{ background: "#fff", border: "1px solid var(--rule)", borderRadius: 14, padding: 32, boxShadow: "var(--shadow-card)", position: "sticky", top: 96 }}>
-          {authMode === "signup"
-            ? <SignUpCard onOrcid={handleOrcid} onSubmit={handleSignup} toSignin={() => setAuthMode("signin")} />
-            : <SignInCard onOrcid={handleOrcid} onCredentials={enterDemo} toSignup={() => setAuthMode("signup")} />}
+          <AuthCard onOrcid={handleOrcid} />
+
         </div>
       </section>
 
