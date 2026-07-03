@@ -3014,3 +3014,69 @@ a:hover {
 .rf-src.on { background: var(--sage-100); color: var(--sage); }
 .rf-src.off { background: transparent; color: var(--fg-3); border-color: var(--rule); text-decoration: line-through; }
 .rf-routing-fallback { font-size: 12px; color: var(--ochre); background: var(--ochre-100); border-radius: 6px; padding: 6px 10px; }
+
+/* ==========================================================================
+   RESPONSIVE  ---  iPad / iPhone / Android
+   ========================================================================== */
+
+/* Mobile menu toggle + drawer backdrop (base: hidden on desktop) */
+.sidebar-toggle {
+  display: none;
+  align-items: center; justify-content: center;
+  width: 38px; height: 38px;
+  border: 1px solid var(--rule); border-radius: 8px;
+  background: #fff; color: var(--fg-1); cursor: pointer; flex-shrink: 0;
+}
+.sidebar-overlay {
+  position: fixed; inset: 0; z-index: 40;
+  background: rgba(15, 23, 42, 0.42); backdrop-filter: blur(2px);
+}
+
+/* Tablet: collapse the widest two-pane layouts first */
+@media (max-width: 1024px) {
+  .overview-layout,
+  .betaref-layout,
+  .eval-summaries { grid-template-columns: 1fr !important; }
+}
+
+/* Phones & small tablets */
+@media (max-width: 820px) {
+  /* Sidebar becomes an off-canvas drawer opened by the hamburger */
+  .sidebar-toggle { display: inline-flex; }
+  .app-shell { display: block; }
+  .workspace { overflow: visible; }
+  .sidebar {
+    position: fixed; top: 0; left: 0; height: 100vh;
+    width: 82vw; max-width: 320px;
+    transform: translateX(-100%);
+    transition: transform 220ms ease;
+    z-index: 50; box-shadow: 0 12px 40px rgba(0,0,0,0.18);
+  }
+  .sidebar.sidebar-open { transform: translateX(0); }
+
+  /* Collapse every multi-column content grid to a single column */
+  .overview-grid, .overview-layout, .metrics-grid, .eval-summaries,
+  .betaref-layout, .capabilities-grid, .capabilities-cells,
+  .rf-stat-grid, .rf-field-grid, .specimen-metrics {
+    grid-template-columns: 1fr !important;
+  }
+
+  .topbar { padding: 14px 16px 12px; gap: 10px; align-items: center; }
+  .topbar-title { font-size: 22px !important; }
+
+  /* Landing page: stack + scale (overrides its inline styles) */
+  .lp-header { padding: 14px 18px !important; }
+  .lp-nav { gap: 14px !important; }
+  .lp-hero { grid-template-columns: 1fr !important; padding: 40px 20px !important; gap: 32px !important; }
+  .lp-hero h1 { font-size: 38px !important; line-height: 44px !important; }
+  .lp-section { padding: 44px 20px !important; }
+  .lp-grid-2 { grid-template-columns: 1fr !important; }
+}
+
+/* Small phones */
+@media (max-width: 480px) {
+  .topbar-title { font-size: 19px !important; }
+  .lp-hero h1 { font-size: 30px !important; line-height: 36px !important; }
+  .lp-nav a { display: none; }   /* keep only the Sign-in button on tiny screens */
+  .rf-field-grid { grid-template-columns: 1fr !important; }
+}

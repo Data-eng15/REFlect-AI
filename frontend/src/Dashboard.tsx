@@ -18,6 +18,7 @@ import {
   Landmark,
   Loader2,
   LogOut,
+  Menu,
   Search,
   ShieldCheck,
   Sparkles,
@@ -1415,6 +1416,7 @@ export default function Dashboard() {
   const { user, logout } = useAuth();
 
   const [query, setQuery]             = useState(SAMPLE_QUERIES[0]);
+  const [sidebarOpen, setSidebarOpen] = useState(false);  // mobile drawer
   const [result, setResult]           = useState<AnalyzeResponse | null>(null);
   const [loading, setLoading]         = useState(false);
   const [draft, setDraft]             = useState<DraftResponse | null>(null);
@@ -1706,7 +1708,8 @@ export default function Dashboard() {
   return (
     <main className="app-shell">
       {/* ── Sidebar ────────────────────────────────────────── */}
-      <aside className="sidebar" aria-label="Workspace navigation">
+      {sidebarOpen && <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)} />}
+      <aside className={`sidebar${sidebarOpen ? " sidebar-open" : ""}`} aria-label="Workspace navigation">
         <Logo />
 
         <div className="sidebar-section">
@@ -1843,6 +1846,9 @@ export default function Dashboard() {
       <section className="workspace">
         {/* Topbar */}
         <header className="topbar">
+          <button className="sidebar-toggle" onClick={() => setSidebarOpen(true)} aria-label="Open menu">
+            <Menu size={20} />
+          </button>
           <div className="topbar-left">
             <div className="eyebrow">Researcher workspace</div>
             <h1 className="topbar-title">Research impact summariser</h1>

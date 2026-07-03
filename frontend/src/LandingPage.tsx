@@ -162,13 +162,13 @@ export default function LandingPage() {
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", flexDirection: "column" }}>
       {/* Header */}
-      <header style={{
+      <header className="lp-header" style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
         padding: "20px 48px", borderBottom: "1px solid var(--rule)",
         position: "sticky", top: 0, background: "rgba(252,252,250,0.85)", backdropFilter: "blur(8px)", zIndex: 10,
       }}>
         <Logo size={24} />
-        <nav style={{ display: "flex", alignItems: "center", gap: 28 }}>
+        <nav className="lp-nav" style={{ display: "flex", alignItems: "center", gap: 28 }}>
           <a href="#how" style={{ fontSize: 13, fontWeight: 500, color: "var(--fg-2)", textDecoration: "none" }}>How it works</a>
           <a href="#sources" style={{ fontSize: 13, fontWeight: 500, color: "var(--fg-2)", textDecoration: "none" }}>Data sources</a>
           <a href="#" onClick={(e) => e.preventDefault()} style={{ fontSize: 13, fontWeight: 500, color: "var(--fg-2)", textDecoration: "none" }}>Methodology</a>
@@ -177,7 +177,7 @@ export default function LandingPage() {
       </header>
 
       {/* Hero + auth */}
-      <section style={{
+      <section className="lp-hero" style={{
         maxWidth: "var(--container)", width: "100%", margin: "0 auto",
         padding: "80px 48px 64px", display: "grid", gridTemplateColumns: "1.05fr 0.95fr", gap: 64, alignItems: "flex-start",
       }}>
@@ -229,7 +229,7 @@ export default function LandingPage() {
 
       {/* How it works */}
       <section id="how" style={{ maxWidth: "var(--container)", width: "100%", margin: "0 auto", padding: "72px 48px" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1.2fr 2fr", gap: 48, alignItems: "flex-start" }}>
+        <div className="lp-grid-2" style={{ display: "grid", gridTemplateColumns: "1.2fr 2fr", gap: 48, alignItems: "flex-start" }}>
           <div>
             <Eyebrow>How it works</Eyebrow>
             <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 32, lineHeight: "40px", fontWeight: 500, letterSpacing: "-0.01em", marginTop: 12, color: "var(--ink)" }}>
@@ -239,7 +239,7 @@ export default function LandingPage() {
               REFlect AI coordinates five retrieval agents and a RAG synthesiser. Every sentence in the final narrative is anchored to the source it came from, so reviewers can audit the chain of evidence.
             </p>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, background: "var(--rule)", border: "1px solid var(--rule)", borderRadius: 10, overflow: "hidden" }}>
+          <div className="lp-grid-2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, background: "var(--rule)", border: "1px solid var(--rule)", borderRadius: 10, overflow: "hidden" }}>
             {([
               [<Search size={18} />, "Metadata retrieval", "Resolves DOIs, titles, and arXiv IDs through Crossref and OpenAlex; harmonises authors, years, and abstracts."],
               [<TrendingUp size={18} />, "Citation tracking", "Traces forward citations through Semantic Scholar and OpenAlex; clusters them by venue and topic."],
@@ -260,9 +260,14 @@ export default function LandingPage() {
 
       {/* Footer */}
       <footer style={{ padding: "28px 48px", borderTop: "1px solid var(--rule)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <Logo size={20} />
-          <span style={{ fontSize: 12, color: "var(--fg-3)" }}>© 2026 REFlect AI — Research impact intelligence.</span>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <Logo size={20} />
+            <span style={{ fontSize: 12, color: "var(--fg-3)" }}>© 2026 REFlect AI — Research impact intelligence.</span>
+          </div>
+          <span style={{ fontSize: 12.5, color: "var(--fg-2)" }}>
+            Designed &amp; developed by <strong style={{ color: "var(--fg-1)" }}>Soham Dharne</strong> (MSc Artificial Intelligence) · under the supervision of <strong style={{ color: "var(--fg-1)" }}>Dr Raza Haider</strong>
+          </span>
         </div>
         <div style={{ display: "flex", gap: 20, fontSize: 12, color: "var(--fg-3)" }}>
           <a href="#" onClick={(e) => e.preventDefault()} style={{ color: "inherit", textDecoration: "none" }}>Privacy</a>
