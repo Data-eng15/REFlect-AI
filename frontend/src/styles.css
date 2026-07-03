@@ -3080,3 +3080,22 @@ a:hover {
   .lp-nav a { display: none; }   /* keep only the Sign-in button on tiny screens */
   .rf-field-grid { grid-template-columns: 1fr !important; }
 }
+
+/* Search + actions row: wrap the buttons under a full-width input on narrow screens */
+@media (max-width: 640px) {
+  .query-input-row { flex-wrap: wrap; }
+  .query-input-wrap { flex: 1 1 100%; }
+  .query-actions { width: 100%; }
+  .query-actions .btn { flex: 1; justify-content: center; }
+  .quick-pills { flex-wrap: wrap; }
+}
+
+/* Sidebar author credit */
+.sidebar-credit {
+  font-size: 10.5px;
+  line-height: 15px;
+  color: var(--fg-3);
+  padding-top: 10px;
+  border-top: 1px solid var(--rule);
+}
+.sidebar-credit strong { color: var(--fg-2); font-weight: 600; }

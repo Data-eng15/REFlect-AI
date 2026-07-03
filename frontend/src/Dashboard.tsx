@@ -1819,6 +1819,11 @@ export default function Dashboard() {
             <LogOut size={15} />
           </button>
         </div>
+
+        <div className="sidebar-credit">
+          Designed &amp; developed by <strong>Soham Dharne</strong> (MSc AI)<br />
+          under the supervision of <strong>Dr Raza Haider</strong>
+        </div>
       </aside>
 
       <ProfileDrawer
