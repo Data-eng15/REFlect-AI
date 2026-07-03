@@ -223,15 +223,22 @@ export default function LandingPage() {
   const { loginWithOrcid } = useAuth();
   const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
 
-  // Credential / institution submit → demo session (mock), then into the dashboard.
-  const enterDemo = () => {
-    localStorage.setItem("isAuthenticated", "true");
-    sessionStorage.removeItem("rf_manual");
-    navigate("/dashboard");
+  const handleOrcid = async () => {
+    try {
+      const signedIn = await loginWithOrcid();
+      if (signedIn) navigate("/dashboard");
+      // otherwise the browser is redirecting to ORCID's authorize page
+    } catch (e) {
+      console.error("ORCID sign-in failed", e);
+    }
   };
 
-  // Manual sign-up → persist the identity so the dashboard can resolve a real
-  // OpenAlex profile by name (Phase 1 manual path), then enter the workspace.
+  // Email/password and "institution" login have no backend and are not real
+  // authentication — every sign-in attempt is routed to real ORCID OAuth.
+  const enterDemo = () => { void handleOrcid(); };
+
+  // Manual sign-up keeps the self-declared identity (for name-based profile
+  // resolution), but authentication itself must go through ORCID.
   const handleSignup = (form: SignupForm) => {
     const name = `${form.first} ${form.last}`.trim();
     if (name) {
@@ -240,18 +247,7 @@ export default function LandingPage() {
         affiliation: form.affil, scholar: form.scholar, linkedin: form.linkedin, orcid: form.orcid,
       }));
     }
-    localStorage.setItem("isAuthenticated", "true");
-    navigate("/dashboard");
-  };
-
-  const handleOrcid = async () => {
-    try {
-      const signedIn = await loginWithOrcid();
-      if (signedIn) navigate("/dashboard");
-      // if not signedIn, the browser is redirecting to ORCID's authorize page
-    } catch {
-      enterDemo();
-    }
+    void handleOrcid();
   };
 
   return (

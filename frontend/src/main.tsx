@@ -16,9 +16,9 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
       </div>
     );
   }
-  // Allow access if user is logged in OR if legacy localStorage auth is set (demo mode)
-  const legacyAuth = localStorage.getItem("isAuthenticated") === "true";
-  if (!user && !legacyAuth) {
+  // Real authentication only: a verified OAuth session (ORCID / Google) is required.
+  // The old localStorage "demo" bypass has been removed for security.
+  if (!user) {
     return <Navigate to="/" replace />;
   }
   return <>{children}</>;

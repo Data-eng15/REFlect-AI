@@ -5,15 +5,9 @@ import { useAuth } from "./AuthContext";
 
 export default function LoginModal({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
-  const { loginWithGoogle, loginWithGithub, loginWithLinkedin } = useAuth();
+  const { loginWithGoogle, loginWithGithub, loginWithOrcid } = useAuth();
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
-
-  const handleDemoAccess = () => {
-    localStorage.setItem("isAuthenticated", "true");
-    onClose();
-    navigate("/dashboard");
-  };
 
   const handleGoogle = async () => {
     setLoading("google"); setError(null);
@@ -22,7 +16,7 @@ export default function LoginModal({ onClose }: { onClose: () => void }) {
       onClose(); navigate("/dashboard");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Google sign-in failed";
-      setError(msg.includes("not-configured") || msg.includes("api-key") ? "Firebase not configured — use Demo Access below." : msg);
+      setError(msg.includes("not-configured") || msg.includes("api-key") ? "Google/GitHub sign-in isn't configured yet — use ORCID above." : msg);
     } finally { setLoading(null); }
   };
 
@@ -33,8 +27,21 @@ export default function LoginModal({ onClose }: { onClose: () => void }) {
       onClose(); navigate("/dashboard");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "GitHub sign-in failed";
-      setError(msg.includes("not-configured") || msg.includes("api-key") ? "Firebase not configured — use Demo Access below." : msg);
+      setError(msg.includes("not-configured") || msg.includes("api-key") ? "Google/GitHub sign-in isn't configured yet — use ORCID above." : msg);
     } finally { setLoading(null); }
+  };
+
+  const handleOrcid = async () => {
+    setLoading("orcid"); setError(null);
+    try {
+      const signedIn = await loginWithOrcid();
+      // When ORCID OAuth is configured, loginWithOrcid redirects the browser to
+      // orcid.org and returns false; on the (mock) in-place path it returns true.
+      if (signedIn) { onClose(); navigate("/dashboard"); }
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "ORCID sign-in failed");
+      setLoading(null);
+    }
   };
 
   return (
@@ -54,6 +61,16 @@ export default function LoginModal({ onClose }: { onClose: () => void }) {
 
         {/* Social sign-in */}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <button className="social-btn" onClick={handleOrcid} disabled={!!loading} style={{ borderColor: "#A6CE39", fontWeight: 600 }}>
+            {loading === "orcid" ? <span className="social-spinner" /> : (
+              <svg width="16" height="16" viewBox="0 0 256 256" aria-hidden="true">
+                <circle cx="128" cy="128" r="128" fill="#A6CE39"/>
+                <path fill="#fff" d="M86.3 186.2H70.9V79.1h15.4v107.1zM108.9 79.1h41.6c39.6 0 57 28.3 57 53.6 0 27.5-21.5 53.6-56.8 53.6h-41.8V79.1zm15.4 93.3h24.5c34.9 0 42.9-26.5 42.9-39.7 0-21.5-13.7-39.7-43.7-39.7h-23.7v79.4zM88.7 56.8c0 5.5-4.5 10.1-10.1 10.1-5.6 0-10.1-4.6-10.1-10.1 0-5.6 4.5-10.1 10.1-10.1 5.6 0 10.1 4.6 10.1 10.1z"/>
+              </svg>
+            )}
+            Continue with ORCID iD
+          </button>
+
           <button className="social-btn" onClick={handleGoogle} disabled={!!loading}>
             {loading === "google" ? <span className="social-spinner" /> : (
               <svg width="16" height="16" viewBox="0 0 18 18" fill="none">
@@ -75,21 +92,7 @@ export default function LoginModal({ onClose }: { onClose: () => void }) {
             Continue with GitHub
           </button>
 
-          <button className="social-btn" onClick={loginWithLinkedin} disabled={!!loading}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 01-2.063-2.065 2.064 2.064 0 112.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/>
-            </svg>
-            Continue with LinkedIn
-          </button>
         </div>
-
-        <div className="modal-divider">or</div>
-
-        {/* Demo access */}
-        <button className="demo-access-btn" onClick={handleDemoAccess}>
-          Continue with Demo Access
-          <span className="demo-tag">No account needed</span>
-        </button>
 
         <p className="modal-footnote">
           New researcher?{" "}
