@@ -39,6 +39,13 @@ def rate_limit(request: Request, limit: int = 20, window: int = 60) -> None:
     ip = request.client.host if request.client else "unknown"
     _check_rate(ip, limit, window)
 
+async def require_user(current_user: Optional[dict] = Depends(get_current_user)) -> dict:
+    """Auth gate for expensive/LLM endpoints — 401 unless a valid ORCID/OAuth token
+    is presented. Public read endpoints (search, stats, profile) remain open."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required. Please sign in with ORCID.")
+    return current_user
+
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175")
 allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
@@ -284,7 +291,7 @@ def _prune_drafts() -> None:
         _draft_store.pop(k, None)
 
 @app.post("/api/analyze")
-async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_user: Optional[dict] = Depends(get_current_user)) -> dict:
+async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_user: dict = Depends(require_user)) -> dict:
     """Stage 1: gather evidence and draft one candidate sentence per evidence
     item for human curation. Does NOT produce the final summary — that happens
     in /api/compose once the reviewer selects sentences."""
@@ -319,7 +326,7 @@ class ComposeRequest(BaseModel):
     selected_ids: list[int] = Field(default_factory=list)
 
 @app.post("/api/compose")
-async def compose(request: Request, body: ComposeRequest = Body(...), current_user: Optional[dict] = Depends(get_current_user)) -> dict:
+async def compose(request: Request, body: ComposeRequest = Body(...), current_user: dict = Depends(require_user)) -> dict:
     """Stage 2: weave the reviewer-approved candidate sentences into the final
     REF summary, validate it, and return the full result."""
     rate_limit(request, limit=10, window=60)
@@ -385,7 +392,7 @@ async def history(request: Request, limit: int = 20, uid: Optional[str] = Depend
     return {"uid":uid,"queries":[r["query"] for r in rows if r.get("query")],"history":rows}
 
 @app.post("/api/evaluate")
-async def evaluate(request: Request, body: AnalyzeRequest = Body(...), current_user: Optional[dict] = Depends(get_current_user)) -> dict:
+async def evaluate(request: Request, body: AnalyzeRequest = Body(...), current_user: dict = Depends(require_user)) -> dict:
     rate_limit(request, limit=5, window=60)
     try: safe_query = validate_query(body.query)
     except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc))
@@ -448,7 +455,7 @@ class BetaRefRequest(BaseModel):
     doi: Optional[str] = None; citation_count: int = 0; summary: str = ""; evidence: list[dict] = []
 
 @app.post("/api/ref/beta")
-async def ref_beta(request: Request, body: BetaRefRequest = Body(...), current_user: Optional[dict] = Depends(get_current_user)) -> dict:
+async def ref_beta(request: Request, body: BetaRefRequest = Body(...), current_user: dict = Depends(require_user)) -> dict:
     rate_limit(request, limit=5, window=60)
     try: validate_query(body.query)
     except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc))
