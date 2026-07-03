@@ -1737,13 +1737,17 @@ export default function Dashboard() {
                 </button>
               ))}
             </div>
-          ) : (
+          ) : history.length ? (
             <div className="sidebar-history-list">
-              {(history.length ? history : SAMPLE_QUERIES).map(item => (
+              {history.map(item => (
                 <button key={item} className="sidebar-history-item" onClick={() => analyze(undefined, item)}>
                   {item}
                 </button>
               ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: "var(--fg-3)", lineHeight: "18px", padding: "4px 2px" }}>
+              No publications linked to your ORCID iD yet. Search any paper above to analyse it.
             </div>
           ))}
         </div>
@@ -1757,17 +1761,27 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {stats && (
+        {profile && (
           <div className="sidebar-section">
-            <div className="eyebrow" style={{ marginBottom: 10 }}>Pipeline stats</div>
+            <div className="eyebrow" style={{ marginBottom: 10 }}>Research impact</div>
             <div className="sidebar-stat">
-              <span className="sidebar-stat-label">Analyses run</span>
-              <span className="sidebar-stat-value">{stats.total_analyses}</span>
+              <span className="sidebar-stat-label">Publications</span>
+              <span className="sidebar-stat-value">{profile.works_count.toLocaleString()}</span>
             </div>
             <div className="sidebar-stat" style={{ marginTop: 6 }}>
-              <span className="sidebar-stat-label">Avg. faithfulness</span>
-              <span className="sidebar-stat-value">{stats.avg_faithfulness.toFixed(2)}</span>
+              <span className="sidebar-stat-label">Total citations</span>
+              <span className="sidebar-stat-value">{profile.total_citations.toLocaleString()}</span>
             </div>
+            <div className="sidebar-stat" style={{ marginTop: 6 }}>
+              <span className="sidebar-stat-label">h-index</span>
+              <span className="sidebar-stat-value">{profile.h_index}</span>
+            </div>
+            {profile.i10_index ? (
+              <div className="sidebar-stat" style={{ marginTop: 6 }}>
+                <span className="sidebar-stat-label">i10-index</span>
+                <span className="sidebar-stat-value">{profile.i10_index}</span>
+              </div>
+            ) : null}
           </div>
         )}
 
