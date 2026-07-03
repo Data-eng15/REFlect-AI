@@ -2014,7 +2014,7 @@ export default function Dashboard() {
               <div className="rf-greeting-eyebrow">{returning ? "Welcome back" : "Welcome"}</div>
               <h2 className="rf-greeting">
                 {returning ? "Welcome back, " : "Welcome, "}
-                <span className="rf-greeting-name">Prof. {greetLast}</span>.
+                <span className="rf-greeting-name">Researcher {greetLast}</span>.
               </h2>
               <div className="empty-body">
                 Paste a DOI, title, arXiv ID, or BibTeX entry above and REFlect AI will trace its
