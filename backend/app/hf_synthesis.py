@@ -25,6 +25,12 @@ _GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 _last_error: list[str] = []
 
+# Per-request LLM provider override (async-safe via contextvar; propagates into
+# asyncio.to_thread). Lets one authenticated request opt into the local SLM
+# without changing the global default. None -> fall back to the env setting.
+import contextvars as _cv
+_provider_override: "_cv.ContextVar" = _cv.ContextVar("llm_provider_override", default=None)
+
 
 # ── Key helpers ───────────────────────────────────────────────────────────────
 
@@ -37,8 +43,28 @@ def _gemini_key() -> str:
 def _gemini_model() -> str:
     return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+# ── Local SLM (Ollama, OpenAI-compatible) — opt-in via LLM_PROVIDER ────────────
+def _ollama_url() -> str:
+    return os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+
+def _local_model() -> str:
+    return os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")  # base 3B — matches cloud faithfulness
+
+def _llm_mode() -> str:
+    """LLM routing mode (default keeps production on the cloud, untouched):
+      cloud       -> Groq -> Gemini (default)
+      local       -> local SLM first, cloud fallback on failure
+      local_only  -> local SLM only (for clean benchmarking).
+    A per-request override (contextvar) wins over the env default when set."""
+    ov = _provider_override.get()
+    if ov:
+        return ov
+    return os.getenv("LLM_PROVIDER", "cloud").strip().lower()
+
 def _active_provider() -> str:
     """Return which provider is currently configured."""
+    if _llm_mode() in ("local", "local_only"):
+        return "local"
     if _groq_key():
         return "groq"
     if _gemini_key():
@@ -141,9 +167,42 @@ def _call_gemini(system: str, user: str, max_tokens: int = 500) -> str | None:
     return None
 
 
-# ── Unified call — tries Groq first, falls back to Gemini ────────────────────
+# ── Local SLM call (Ollama /v1/chat/completions, OpenAI-compatible) ──────────
+
+def _call_local(system: str, user: str, max_tokens: int = 500) -> str | None:
+    """Local small language model via Ollama — runs entirely on the VM, no
+    network or API key. CPU inference is slow, so the timeout is generous."""
+    payload = {
+        "model": _local_model(),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+        "stream": False,
+    }
+    try:
+        resp = httpx.post(f"{_ollama_url()}/v1/chat/completions", json=payload, timeout=600)
+        if not resp.is_success:
+            _last_error.append(f"Local {resp.status_code}: {resp.text[:120]}")
+            return None
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        _last_error.append(f"Local SLM exception: {exc}")
+        return None
+
+
+# ── Unified call — routes to local or cloud based on LLM_PROVIDER ─────────────
 
 def _call(system: str, user: str, max_tokens: int = 500) -> str | None:
+    mode = _llm_mode()
+    if mode in ("local", "local_only"):
+        result = _call_local(system, user, max_tokens)
+        if result or mode == "local_only":
+            return result
+        _last_error.append("Local SLM failed — falling back to cloud")
+    # Cloud path (default; unchanged)
     if _groq_key():
         result = _call_groq(system, user, max_tokens)
         if result:
@@ -159,6 +218,8 @@ def _call(system: str, user: str, max_tokens: int = 500) -> str | None:
 
 
 def _provider_label() -> str:
+    if _llm_mode() in ("local", "local_only"):
+        return f"local:{_local_model()}"
     if _groq_key():
         return f"groq:{os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')}"
     if _gemini_key():
@@ -218,7 +279,7 @@ class HFSynthesizer:
     """Multi-provider synthesiser: Groq → Gemini → deterministic fallback."""
 
     def enabled(self) -> bool:
-        return bool(_groq_key() or _gemini_key())
+        return bool(_llm_mode() in ("local", "local_only") or _groq_key() or _gemini_key())
 
     def generate(
         self,

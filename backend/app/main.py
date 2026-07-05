@@ -46,6 +46,19 @@ async def require_user(current_user: Optional[dict] = Depends(get_current_user))
         raise HTTPException(status_code=401, detail="Authentication required. Please sign in with ORCID.")
     return current_user
 
+# Per-request LLM engine override (Cloud vs local on-VM SLM), opt-in via the
+# X-LLM-Provider header. Disabled unless ALLOW_LLM_OVERRIDE=true, so the default
+# production behaviour (cloud) is unchanged.
+_ALLOW_LLM_OVERRIDE = os.getenv("ALLOW_LLM_OVERRIDE", "false").strip().lower() in ("1", "true", "yes")
+
+def apply_llm_override(request: Request) -> None:
+    if not _ALLOW_LLM_OVERRIDE:
+        return
+    val = (request.headers.get("x-llm-provider") or "").strip().lower()
+    if val in ("local", "local_only", "cloud"):
+        from .hf_synthesis import _provider_override
+        _provider_override.set("local_only" if val in ("local", "local_only") else "cloud")
+
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175")
 allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
@@ -296,6 +309,7 @@ async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_us
     item for human curation. Does NOT produce the final summary — that happens
     in /api/compose once the reviewer selects sentences."""
     rate_limit(request, limit=10, window=60)
+    apply_llm_override(request)
     try: safe_query = validate_query(body.query)
     except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc))
     result = await analyze_paper(safe_query, fields=body.fields)
@@ -330,6 +344,7 @@ async def compose(request: Request, body: ComposeRequest = Body(...), current_us
     """Stage 2: weave the reviewer-approved candidate sentences into the final
     REF summary, validate it, and return the full result."""
     rate_limit(request, limit=10, window=60)
+    apply_llm_override(request)
     entry = _draft_store.get(body.draft_id)
     if not entry or (time.time() - entry[0]) > _DRAFT_TTL:
         raise HTTPException(status_code=404, detail="Draft expired — please re-run the analysis.")
