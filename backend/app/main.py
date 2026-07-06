@@ -303,6 +303,29 @@ def _prune_drafts() -> None:
     for k in [k for k, (t, _) in _draft_store.items() if now - t > _DRAFT_TTL]:
         _draft_store.pop(k, None)
 
+# ── Result caches ─────────────────────────────────────────────────────────────
+# With many concurrent users, popular papers repeat constantly. Serving repeats
+# from cache costs ZERO inference (no local CPU, no cloud tokens) and returns
+# instantly — the single biggest quota/throughput lever at multi-user scale.
+_analyze_cache: dict[str, tuple[float, dict]] = {}
+_ANALYZE_TTL = 12 * 3600       # gathered evidence + drafts stay fresh for 12 h
+_compose_cache: dict[str, tuple[float, dict]] = {}
+_COMPOSE_TTL = 7 * 24 * 3600   # composed summaries for a week
+_CACHE_MAX = 400               # entries per cache; oldest quarter evicted
+
+def _cache_get(cache: dict, key: str, ttl: int):
+    hit = cache.get(key)
+    if hit and (time.time() - hit[0]) < ttl:
+        return hit[1]
+    cache.pop(key, None)
+    return None
+
+def _cache_put(cache: dict, key: str, value) -> None:
+    if len(cache) >= _CACHE_MAX:
+        for k in sorted(cache, key=lambda k: cache[k][0])[: _CACHE_MAX // 4]:
+            cache.pop(k, None)
+    cache[key] = (time.time(), value)
+
 @app.post("/api/analyze")
 async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_user: dict = Depends(require_user)) -> dict:
     """Stage 1: gather evidence and draft one candidate sentence per evidence
@@ -312,7 +335,13 @@ async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_us
     apply_llm_override(request)
     try: safe_query = validate_query(body.query)
     except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc))
-    result = await analyze_paper(safe_query, fields=body.fields)
+
+    a_key = f"{safe_query.strip().lower()}|{','.join(sorted(body.fields or []))}"
+    result = _cache_get(_analyze_cache, a_key, _ANALYZE_TTL)
+    was_cached = result is not None
+    if not was_cached:
+        result = await analyze_paper(safe_query, fields=body.fields)
+        _cache_put(_analyze_cache, a_key, result)
     meta = result.get("metadata")
     access = await check_author_access(doi=meta.doi if meta else None, user_name=current_user.get("name") if current_user else None, paper_authors=meta.authors if meta else None)
 
@@ -323,6 +352,7 @@ async def analyze(request: Request, body: AnalyzeRequest = Body(...), current_us
     return {
         "draft_id": draft_id,
         "stage": "draft",
+        "cached": was_cached,
         "metadata": meta,
         "evidence": result["evidence"],
         "candidates": result["candidates"],
@@ -357,6 +387,15 @@ async def compose(request: Request, body: ComposeRequest = Body(...), current_us
     selected_evidence = [evidence[c["id"]] for c in selected if c["id"] < len(evidence)]
     sentences = [c["text"] for c in selected]
 
+    meta_obj = st.get("metadata")
+    c_key = f"{str((meta_obj.doi or meta_obj.title) if meta_obj else 'unknown').lower()}|{','.join(map(str, sorted(sel)))}"
+    cached_resp = _cache_get(_compose_cache, c_key, _COMPOSE_TTL)
+    if cached_resp is not None:
+        response = dict(cached_resp)
+        response["cached"] = True
+        response["access"] = await check_author_access(doi=meta_obj.doi if meta_obj else None, user_name=current_user.get("name") if current_user else None, paper_authors=meta_obj.authors if meta_obj else None)
+        return response
+
     comp = await asyncio.to_thread(
         compose_summary, st["metadata"], st["citation_count"], st["topics"],
         selected_evidence, sentences, st.get("rag_contexts", []),
@@ -380,9 +419,12 @@ async def compose(request: Request, body: ComposeRequest = Body(...), current_us
     }
     save_analysis(full, user_uid=st.get("uid"))
     response = AnalyzeResponse(**full).model_dump()
-    response["access"] = await check_author_access(doi=st["metadata"].doi if st["metadata"] else None, user_name=current_user.get("name") if current_user else None, paper_authors=st["metadata"].authors if st["metadata"] else None)
     response["routing"] = st.get("routing", {})
     response["references"] = comp["references"]
+    response["cached"] = False
+    _cache_put(_compose_cache, c_key, response)   # cached WITHOUT the per-user access block
+    response = dict(response)
+    response["access"] = await check_author_access(doi=st["metadata"].doi if st["metadata"] else None, user_name=current_user.get("name") if current_user else None, paper_authors=st["metadata"].authors if st["metadata"] else None)
     return response
 
 @app.get("/api/stats")

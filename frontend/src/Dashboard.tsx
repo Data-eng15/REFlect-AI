@@ -1417,7 +1417,7 @@ export default function Dashboard() {
 
   const [query, setQuery]             = useState(SAMPLE_QUERIES[0]);
   const [sidebarOpen, setSidebarOpen] = useState(false);  // mobile drawer
-  const [engine, setEngine]           = useState<"cloud" | "local">("cloud");  // LLM engine
+  const [engine, setEngine]           = useState<"cloud" | "local">("local");  // LLM engine — local-first by default
   const [result, setResult]           = useState<AnalyzeResponse | null>(null);
   const [loading, setLoading]         = useState(false);
   const [draft, setDraft]             = useState<DraftResponse | null>(null);
@@ -1492,7 +1492,7 @@ export default function Dashboard() {
     setLastQuery(resolvedQuery);
 
     try {
-      const headers = { "Content-Type": "application/json", ...(engine === "local" ? { "X-LLM-Provider": "local" } : {}), ...(await getAuthHeader()) };
+      const headers = { "Content-Type": "application/json", "X-LLM-Provider": engine, ...(await getAuthHeader()) };
       // Stage 1 — gather evidence + draft candidate sentences for curation.
       const resp = await apiFetch(`${API_URL}/api/analyze`, {
         method: "POST", headers, body: JSON.stringify({ query: resolvedQuery, fields: routingFields }),
@@ -1518,7 +1518,7 @@ export default function Dashboard() {
     if (!draft || selectedIds.size === 0) return;
     setComposing(true); setError(null);
     try {
-      const headers = { "Content-Type": "application/json", ...(engine === "local" ? { "X-LLM-Provider": "local" } : {}), ...(await getAuthHeader()) };
+      const headers = { "Content-Type": "application/json", "X-LLM-Provider": engine, ...(await getAuthHeader()) };
       const resp = await apiFetch(`${API_URL}/api/compose`, {
         method: "POST", headers,
         body: JSON.stringify({ draft_id: draft.draft_id, selected_ids: [...selectedIds] }),
@@ -1589,7 +1589,7 @@ export default function Dashboard() {
     setEvalLoading(true); setEvalError(null);
     if (!autoMode) setActiveTab("eval");
     try {
-      const headers = { "Content-Type": "application/json", ...(engine === "local" ? { "X-LLM-Provider": "local" } : {}), ...(await getAuthHeader()) };
+      const headers = { "Content-Type": "application/json", "X-LLM-Provider": engine, ...(await getAuthHeader()) };
       const resp = await apiFetch(`${API_URL}/api/evaluate`, {
         method: "POST", headers, body: JSON.stringify({ query: q }),
       });
@@ -1607,7 +1607,7 @@ export default function Dashboard() {
     if (!result) return;
     setBetaLoading(true); setBetaError(null); setBetaRef(null); setActiveTab("betaref");
     try {
-      const headers = { "Content-Type": "application/json", ...(engine === "local" ? { "X-LLM-Provider": "local" } : {}), ...(await getAuthHeader()) };
+      const headers = { "Content-Type": "application/json", "X-LLM-Provider": engine, ...(await getAuthHeader()) };
       const body = {
         query: result.metadata.title ?? query,
         title: result.metadata.title,
@@ -1910,9 +1910,11 @@ export default function Dashboard() {
 
           <div className="engine-toggle">
             <span className="engine-label">Engine</span>
-            <button type="button" className={`engine-opt${engine === "cloud" ? " active" : ""}`} onClick={() => setEngine("cloud")}>Cloud</button>
             <button type="button" className={`engine-opt${engine === "local" ? " active" : ""}`} onClick={() => setEngine("local")}>Local · on-VM 3B</button>
-            <span className="engine-note">{engine === "local" ? "Private on-server inference — no data leaves the VM · slower (~5–30s)" : "Groq → Gemini · fastest"}</span>
+            <button type="button" className={`engine-opt${engine === "cloud" ? " active" : ""}`} onClick={() => setEngine("cloud")}>Cloud</button>
+            <span className="engine-note">{engine === "local"
+              ? "Default — private on-server inference, auto cloud fallback if quality dips (~20–30s)"
+              : "Groq → Gemini · fastest (~8s) · uses shared API quota"}</span>
           </div>
 
           <div className="quick-pills">

@@ -1562,13 +1562,48 @@ def compose_summary(
     logs.extend(judge_logs)
     faithfulness = slm_faith if slm_faith >= 0.0 else score_faithfulness(summary, selected_evidence, rag_contexts, citation_count, topics)
 
-    validation_report, val_logs = hf_synthesizer.cross_validate_summary(summary, selected_evidence, citation_count, metadata)
-    logs.extend(val_logs)
+    # ── Quality gate: local-first, cloud fallback on degraded output ─────────
+    # When the local SLM produced the summary and its (locally judged) faith-
+    # fulness falls below the guardrail, regenerate once with the cloud model
+    # and keep whichever scores higher. Keeps ~all traffic on-VM; cloud is
+    # insurance only. "local_only" mode never falls back (clean benchmarking).
+    from .hf_synthesis import _llm_mode, _provider_override, _groq_key, _gemini_key
+    is_local = _llm_mode() in ("local", "local_only")
+    if (_llm_mode() == "local" and faithfulness < 0.75 and (_groq_key() or _gemini_key())):
+        logs.append(log("Guardrail", "Local summary below threshold — regenerating with cloud",
+                        local_faithfulness=faithfulness, threshold=0.75))
+        _tok = _provider_override.set("cloud")
+        try:
+            woven2, provider2, logs2 = hf_synthesizer.compose(metadata, citation_count, sentences, references)
+            logs.extend(logs2)
+            if woven2:
+                sf2, jl2 = hf_synthesizer.evaluate_faithfulness(woven2, selected_evidence, rag_contexts)
+                logs.extend(jl2)
+                faith2 = sf2 if sf2 >= 0.0 else score_faithfulness(woven2, selected_evidence, rag_contexts, citation_count, topics)
+                if faith2 > faithfulness:
+                    summary, faithfulness = woven2, faith2
+                    model_provider = f"local->{provider2}"  # ASCII: safe on cp1252 consoles/logs
+                    logs.append(log("Guardrail", "Cloud fallback accepted", faithfulness_score=faith2))
+                else:
+                    logs.append(log("Guardrail", "Local summary retained (cloud did not score higher)", cloud_faithfulness=faith2))
+        finally:
+            _provider_override.reset(_tok)
 
-    ref_report, ref_logs = hf_synthesizer.generate_ref_report(metadata, selected_evidence, summary, topics)
-    logs.extend(ref_logs)
-    if not ref_report:
+    # Local speed trim: the 4-dimension peer review and the separate REF
+    # paragraph are extra LLM calls that roughly double local latency; on the
+    # local path we skip them (REF tab reuses the composed summary).
+    if is_local:
+        validation_report: dict = {}
         ref_report = summary
+        logs.append(log("Synthesis", "Local engine: peer-review and separate REF paragraph skipped for speed"))
+    else:
+        validation_report, val_logs = hf_synthesizer.cross_validate_summary(summary, selected_evidence, citation_count, metadata)
+        logs.extend(val_logs)
+
+        ref_report, ref_logs = hf_synthesizer.generate_ref_report(metadata, selected_evidence, summary, topics)
+        logs.extend(ref_logs)
+        if not ref_report:
+            ref_report = summary
 
     guardrail_status = "passed" if faithfulness >= 0.75 else "review"
     limitations = []

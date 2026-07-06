@@ -373,6 +373,12 @@ STRICT RULES:
         sentence stays strictly faithful to its single source."""
         logs: list[TraceLog] = []
         items = evidence[:24]
+        # Local CPU inference: LLM-draft only the top items (the rest get
+        # deterministic sentences) and cap output tokens, so the draft stage
+        # stays ~10s instead of ~30s. Cloud drafts everything as before.
+        is_local = _llm_mode() in ("local", "local_only")
+        llm_items = items[:12] if is_local else items
+        draft_max_tokens = 700 if is_local else 1400
         etal = f"{(metadata.authors[0].split()[-1] if metadata.authors else 'the authors')} et al. ({metadata.year or 'n.d.'})"
 
         def _fallback(e: EvidenceItem) -> str:
@@ -381,12 +387,12 @@ STRICT RULES:
             return f"{e.title}{cc} — {bits} evidencing downstream engagement with the work."
 
         parsed: dict[int, str] = {}
-        if self.enabled() and items:
+        if self.enabled() and llm_items:
             ev_block = "\n".join(
                 f"{i+1}. [{e.kind}] {e.title} ({e.source}, {e.year or 'n.d.'})"
                 + (f", {e.citation_count:,} citations" if e.citation_count else "")
                 + (f" — {(e.snippet or '')[:160]}" if e.snippet else "")
-                for i, e in enumerate(items)
+                for i, e in enumerate(llm_items)
             )
             system = (
                 "You are a UK REF impact analyst drafting candidate evidence sentences "
@@ -401,7 +407,7 @@ STRICT RULES:
                 "numbered line per item, reusing the same numbers, and nothing else.\n\n"
                 f"Evidence:\n{ev_block}"
             )
-            raw = _call(system, user, max_tokens=1400)
+            raw = _call(system, user, max_tokens=draft_max_tokens)
             if raw:
                 for line in raw.splitlines():
                     m = re.match(r"\s*(\d+)[\.\)]\s*(.+\S)", line)
