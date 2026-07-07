@@ -456,7 +456,24 @@ async def evaluate(request: Request, body: AnalyzeRequest = Body(...), current_u
     try: safe_query = validate_query(body.query)
     except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc))
     uid = current_user["uid"] if current_user else None
-    agentic_result = await analyze_paper(safe_query)
+    # analyze_paper now returns a DRAFT (evidence + candidate sentences); compose a
+    # summary from all candidates so the agentic side has a summary to compare and
+    # AnalyzeResponse validates. (Evaluation runs on the cloud engine for a fair,
+    # fast agentic-vs-baseline comparison, regardless of the UI engine toggle.)
+    draft = await analyze_paper(safe_query)
+    ev = draft.get("evidence", []); cands = draft.get("candidates", [])
+    sel_ev = [ev[c["id"]] for c in cands if c["id"] < len(ev)]
+    sents = [c["text"] for c in cands]
+    comp = await asyncio.to_thread(
+        compose_summary, draft["metadata"], draft["citation_count"], draft["topics"],
+        sel_ev, sents, draft.get("rag_contexts", []),
+    )
+    agentic_result = {**draft,
+        "summary": comp["summary"], "sections": comp["sections"],
+        "faithfulness_score": comp["faithfulness_score"], "model_provider": comp["model_provider"],
+        "guardrail_status": comp["guardrail_status"], "limitations": comp["limitations"],
+        "ref_report": comp["ref_report"], "validation_report": comp["validation_report"],
+    }
     save_analysis(agentic_result, user_uid=uid)
     comparison = await run_comparison(safe_query, agentic_result)
     save_evaluation(comparison)
