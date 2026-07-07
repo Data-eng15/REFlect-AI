@@ -231,28 +231,26 @@ def _provider_label() -> str:
 # signals, then citations. This ordering decides the [n] numbering.
 _REF_PRIORITY = {"downstream": 0, "patent": 1, "code": 2, "funding": 3, "citation": 4, "full_text": 5}
 
-# Worked format example (a DIFFERENT, fictional paper) — small models copy this
-# style far more reliably than they follow instructions. ~150 words, "et al.",
-# inline [n] citations, exactly three **bold** phrases, one flowing paragraph.
-_REF_STYLE_EXAMPLE = (
-    "Okafor et al. (2019) established a **field-defining method** for low-cost water-quality "
-    "sensing, and the evidence traces its impact well beyond the original publication. "
-    "Independent groups built on the approach in widely-adopted open-source toolkits [1], while "
-    "its measurement protocol underpins downstream studies that themselves attract substantial "
-    "funding [2]. Real-world uptake is concrete: a national environmental agency incorporated the "
-    "technique into monitoring guidance [3], and a granted patent cites the method in an applied "
-    "filtration system [4]. Alongside strong citation reach, this combination of **policy adoption** "
-    "and **industrial translation** shows the work enabled tangible change in how contamination is "
-    "detected and managed. Its significance for research impact lies not in citation volume alone "
-    "but in the traceable pathway from a laboratory method to operational practice across academic, "
-    "governmental, and commercial settings."
+# Structure SKELETON (placeholders, NOT prose) — teaches the shape without any
+# wording to copy, avoiding the example-bleed a full prose example causes on both
+# small and large models. Each <...> and [n] is filled with the paper's own facts.
+_REF_STRUCTURE = (
+    "<Surname> et al. (<year>) introduced <one clause: what the paper contributed>. "
+    "<one sentence: citation reach or a specific downstream adopter, grounded in an approved fact> [1]. "
+    "<one sentence: real-world or technical adoption, grounded in an approved fact> [2]. "
+    "<one sentence: a further adoption or downstream pathway> [3], reflecting **<key impact phrase>**. "
+    "<one sentence: broader disciplinary or societal reach> [4]. "
+    "<closing sentence: overall significance for research impact>, evidencing **<key impact phrase>** "
+    "and **<key impact phrase>**."
 )
 
+# Generic impact terms that legitimately occur in grounded summaries — used only
+# as a bold fallback if the model emits no **bold** at all.
 _BOLD_TARGETS = [
     "downstream influence", "downstream", "real-world adoption", "real-world impact",
-    "widely adopted", "widely-adopted", "open-source", "policy adoption", "policy uptake",
-    "industrial translation", "clinical adoption", "field-defining", "foundational",
-    "practical adoption", "measurable impact", "patent",
+    "widely adopted", "widely-adopted", "open-source", "practical adoption",
+    "broad adoption", "significant impact", "citation reach", "state-of-the-art",
+    "foundational", "clinical adoption", "patent",
 ]
 
 def _ensure_bold(text: str, n: int = 3) -> str:
@@ -510,14 +508,17 @@ STRICT RULES:
         )
         user = (
             "Write a Research Excellence Framework (REF) impact paragraph.\n\n"
-            "=== FOLLOW THIS FORMAT EXACTLY (example is a DIFFERENT paper — copy the STYLE, "
-            "length and formatting, NOT the content) ===\n"
-            f"{_REF_STYLE_EXAMPLE}\n\n"
+            "=== STRUCTURE TO FOLLOW ===\n"
+            "This is a SKELETON, not content. Replace every <...> with THIS paper's own "
+            "approved facts and every [n] with a real reference number. Never output a "
+            "<...> placeholder literally, and do NOT reuse any wording from the skeleton:\n"
+            f"{_REF_STRUCTURE}\n\n"
             "=== STRICT RULES ===\n"
-            f"1. EXACTLY one paragraph, about 150 words (between 140 and 160). Do not exceed 160.\n"
+            f"1. One paragraph of about 150 words — aim for 140-160, and never fewer than 130.\n"
             f"2. Refer to the authors as \"{etal}\" (use this et al. form; do not restate the title).\n"
             "3. Incorporate EVERY approved sentence's fact; add no new facts.\n"
-            "4. Cite sources inline as [n] using the reference numbers below.\n"
+            "4. MUST include at least THREE inline citations written as [1], [2], [3] (the numbers "
+            "from the reference list), each placed right after the fact it supports. Do not omit them.\n"
             "5. Put **bold** markdown around EXACTLY THREE key impact phrases.\n"
             "6. One flowing paragraph — no headings, no lists, no bullet points.\n\n"
             f"=== APPROVED SENTENCES (weave in every one) ===\n{sent_block}\n\n"
