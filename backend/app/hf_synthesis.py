@@ -231,6 +231,62 @@ def _provider_label() -> str:
 # signals, then citations. This ordering decides the [n] numbering.
 _REF_PRIORITY = {"downstream": 0, "patent": 1, "code": 2, "funding": 3, "citation": 4, "full_text": 5}
 
+# Worked format example (a DIFFERENT, fictional paper) — small models copy this
+# style far more reliably than they follow instructions. ~150 words, "et al.",
+# inline [n] citations, exactly three **bold** phrases, one flowing paragraph.
+_REF_STYLE_EXAMPLE = (
+    "Okafor et al. (2019) established a **field-defining method** for low-cost water-quality "
+    "sensing, and the evidence traces its impact well beyond the original publication. "
+    "Independent groups built on the approach in widely-adopted open-source toolkits [1], while "
+    "its measurement protocol underpins downstream studies that themselves attract substantial "
+    "funding [2]. Real-world uptake is concrete: a national environmental agency incorporated the "
+    "technique into monitoring guidance [3], and a granted patent cites the method in an applied "
+    "filtration system [4]. Alongside strong citation reach, this combination of **policy adoption** "
+    "and **industrial translation** shows the work enabled tangible change in how contamination is "
+    "detected and managed. Its significance for research impact lies not in citation volume alone "
+    "but in the traceable pathway from a laboratory method to operational practice across academic, "
+    "governmental, and commercial settings."
+)
+
+_BOLD_TARGETS = [
+    "downstream influence", "downstream", "real-world adoption", "real-world impact",
+    "widely adopted", "widely-adopted", "open-source", "policy adoption", "policy uptake",
+    "industrial translation", "clinical adoption", "field-defining", "foundational",
+    "practical adoption", "measurable impact", "patent",
+]
+
+def _ensure_bold(text: str, n: int = 3) -> str:
+    """Small models often drop **bold** even when instructed. If fewer than two
+    bold phrases are present, deterministically bold up to n high-signal impact
+    phrases that actually appear in the text."""
+    if not text or text.count("**") >= 4:
+        return text
+    added = text.count("**") // 2
+    for t in _BOLD_TARGETS:
+        if added >= n:
+            break
+        pat = re.compile(r"(?<!\*)\b(" + re.escape(t) + r")\b(?!\*)", re.IGNORECASE)
+        m = pat.search(text)
+        if m:
+            text = text[:m.start()] + "**" + m.group(1) + "**" + text[m.end():]
+            added += 1
+    return text
+
+def _trim_words(text: str, hard_max: int = 165) -> str:
+    """Safety net so the summary can't run away: keep whole sentences up to a
+    hard word cap (small models sometimes ignore the length instruction)."""
+    if not text or len(text.split()) <= hard_max:
+        return text
+    sents = re.split(r"(?<=[.!?])\s+", text.strip())
+    out: list[str] = []
+    count = 0
+    for s in sents:
+        w = len(s.split())
+        if count + w > hard_max and out:
+            break
+        out.append(s); count += w
+    return " ".join(out) if out else " ".join(text.split()[:hard_max])
+
 
 def build_references(evidence: list[EvidenceItem], max_refs: int = 6,
                      exclude_doi: str | None = None, exclude_title: str | None = None) -> list[dict]:
@@ -447,23 +503,30 @@ STRICT RULES:
         sent_block = "\n".join(f"- {s}" for s in sentences)
         ref_block = "\n".join(f"[{r['n']}] {r['label']}" for r in references) or "None."
         system = (
-            "You are a senior UK REF impact assessor. You are given a set of "
-            "reviewer-APPROVED, evidence-grounded sentences. Weave them into a single "
-            "flowing impact paragraph using ONLY the facts they contain — add nothing, "
-            "invent nothing, and drop none of their substance."
+            "You are a senior UK REF impact assessor. You are given reviewer-APPROVED, "
+            "evidence-grounded sentences and must weave them into ONE flowing impact "
+            "paragraph using ONLY the facts they contain — add nothing, invent nothing, "
+            "drop none of their substance. You follow formatting rules exactly."
         )
         user = (
-            f"Refer to the paper as: {etal}. Headline citations: {citation_count:,}.\n\n"
-            "Approved sentences (incorporate every one's fact):\n"
-            f"{sent_block}\n\n"
-            "Reference list — cite inline as [n] where a sentence draws on a source:\n"
-            f"{ref_block}\n\n"
-            "Write ONE cohesive ~100-word paragraph: open with what the paper introduced, "
-            "then present the approved impact facts in a logical order with [n] citations and "
-            "2-3 **bold** key phrases. One paragraph, no headings or lists, no new facts."
+            "Write a Research Excellence Framework (REF) impact paragraph.\n\n"
+            "=== FOLLOW THIS FORMAT EXACTLY (example is a DIFFERENT paper — copy the STYLE, "
+            "length and formatting, NOT the content) ===\n"
+            f"{_REF_STYLE_EXAMPLE}\n\n"
+            "=== STRICT RULES ===\n"
+            f"1. EXACTLY one paragraph, about 150 words (between 140 and 160). Do not exceed 160.\n"
+            f"2. Refer to the authors as \"{etal}\" (use this et al. form; do not restate the title).\n"
+            "3. Incorporate EVERY approved sentence's fact; add no new facts.\n"
+            "4. Cite sources inline as [n] using the reference numbers below.\n"
+            "5. Put **bold** markdown around EXACTLY THREE key impact phrases.\n"
+            "6. One flowing paragraph — no headings, no lists, no bullet points.\n\n"
+            f"=== APPROVED SENTENCES (weave in every one) ===\n{sent_block}\n\n"
+            f"=== REFERENCE LIST (cite as [n]) ===\n{ref_block}\n\n"
+            f"Now write the ~150-word REF impact paragraph for {etal}:"
         )
-        summary = _call(system, user, max_tokens=420)
+        summary = _call(system, user, max_tokens=460)
         if summary:
+            summary = _ensure_bold(_trim_words(summary, hard_max=165))
             provider = _provider_label()
             logs.append(log("LLM", f"{provider.split(':')[0].title()} composed summary from {len(sentences)} approved sentences", model=provider, words=len(summary.split())))
             return summary, provider, logs

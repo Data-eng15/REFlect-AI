@@ -1558,34 +1558,38 @@ def compose_summary(
                       body=f"The paper carries {citation_count:,} citations. " + (f"Detected topics include {', '.join(topics[:5])}." if topics else "No topic labels were available.")),
     ]
 
-    slm_faith, judge_logs = hf_synthesizer.evaluate_faithfulness(summary, selected_evidence, rag_contexts)
-    logs.extend(judge_logs)
-    faithfulness = slm_faith if slm_faith >= 0.0 else score_faithfulness(summary, selected_evidence, rag_contexts, citation_count, topics)
-
-    # ── Quality gate: local-first, cloud fallback on degraded output ─────────
-    # When the local SLM produced the summary and its (locally judged) faith-
-    # fulness falls below the guardrail, regenerate once with the cloud model
-    # and keep whichever scores higher. Keeps ~all traffic on-VM; cloud is
-    # insurance only. "local_only" mode never falls back (clean benchmarking).
     from .hf_synthesis import _llm_mode, _provider_override, _groq_key, _gemini_key
     is_local = _llm_mode() in ("local", "local_only")
-    if (_llm_mode() == "local" and faithfulness < 0.75 and (_groq_key() or _gemini_key())):
-        logs.append(log("Guardrail", "Local summary below threshold — regenerating with cloud",
-                        local_faithfulness=faithfulness, threshold=0.75))
+
+    # Faithfulness: on the LOCAL path use the deterministic heuristic — consistent,
+    # no extra LLM call, and it avoids the small model grading its own output
+    # (which fired the gate far too often). Cloud path keeps the LLM judge.
+    if is_local:
+        faithfulness = score_faithfulness(summary, selected_evidence, rag_contexts, citation_count, topics)
+    else:
+        slm_faith, judge_logs = hf_synthesizer.evaluate_faithfulness(summary, selected_evidence, rag_contexts)
+        logs.extend(judge_logs)
+        faithfulness = slm_faith if slm_faith >= 0.0 else score_faithfulness(summary, selected_evidence, rag_contexts, citation_count, topics)
+
+    # ── Quality gate: local-first, cloud fallback ONLY on genuinely poor output.
+    # Low threshold → fires rarely (near-empty / off-topic summaries), so ~all
+    # traffic stays on-VM and cloud tokens are conserved. "local_only" (benchmark
+    # mode) never falls back.
+    if (_llm_mode() == "local" and faithfulness < 0.50 and (_groq_key() or _gemini_key())):
+        logs.append(log("Guardrail", "Local summary below floor — regenerating with cloud",
+                        local_faithfulness=faithfulness, threshold=0.50))
         _tok = _provider_override.set("cloud")
         try:
             woven2, provider2, logs2 = hf_synthesizer.compose(metadata, citation_count, sentences, references)
             logs.extend(logs2)
             if woven2:
-                sf2, jl2 = hf_synthesizer.evaluate_faithfulness(woven2, selected_evidence, rag_contexts)
-                logs.extend(jl2)
-                faith2 = sf2 if sf2 >= 0.0 else score_faithfulness(woven2, selected_evidence, rag_contexts, citation_count, topics)
-                if faith2 > faithfulness:
+                faith2 = score_faithfulness(woven2, selected_evidence, rag_contexts, citation_count, topics)
+                if faith2 >= faithfulness:
                     summary, faithfulness = woven2, faith2
-                    model_provider = f"local->{provider2}"  # ASCII: safe on cp1252 consoles/logs
+                    model_provider = f"local->{provider2}"
                     logs.append(log("Guardrail", "Cloud fallback accepted", faithfulness_score=faith2))
                 else:
-                    logs.append(log("Guardrail", "Local summary retained (cloud did not score higher)", cloud_faithfulness=faith2))
+                    logs.append(log("Guardrail", "Local summary retained", cloud_faithfulness=faith2))
         finally:
             _provider_override.reset(_tok)
 

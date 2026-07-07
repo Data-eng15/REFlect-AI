@@ -56,8 +56,10 @@ def apply_llm_override(request: Request) -> None:
         return
     val = (request.headers.get("x-llm-provider") or "").strip().lower()
     if val in ("local", "local_only", "cloud"):
+        # "local" = local-first WITH cloud fallback (production); "local_only" =
+        # pure local, no fallback (benchmarking); "cloud" = cloud only.
         from .hf_synthesis import _provider_override
-        _provider_override.set("local_only" if val in ("local", "local_only") else "cloud")
+        _provider_override.set(val)
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175")
 allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
