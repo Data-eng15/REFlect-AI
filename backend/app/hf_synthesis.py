@@ -260,6 +260,16 @@ def _ensure_bold(text: str, n: int = 3) -> str:
     if not text or text.count("**") >= 4:
         return text
     added = text.count("**") // 2
+    # Prefer concrete facts first — numbers with a unit (citations/stars/%/etc.).
+    for pat in (r"\d[\d,]*\s*(?:citations|stars|patents|downloads|forks|publications)",
+                r"\d[\d,]*%"):
+        if added >= n:
+            break
+        m = re.search(r"(?<!\*)(" + pat + r")(?!\*)", text, re.IGNORECASE)
+        if m:
+            text = text[:m.start()] + "**" + m.group(1) + "**" + text[m.end():]
+            added += 1
+    # Then generic impact terms.
     for t in _BOLD_TARGETS:
         if added >= n:
             break
@@ -268,6 +278,24 @@ def _ensure_bold(text: str, n: int = 3) -> str:
         if m:
             text = text[:m.start()] + "**" + m.group(1) + "**" + text[m.end():]
             added += 1
+    return text
+
+# Deterministic de-puffing: small models sometimes emit banned filler anyway.
+# Word-level swaps keep grammar intact while removing the empty phrasing that the
+# real REF samples never use.
+_DEFLATE = {
+    "profound influence": "influence", "significant impact": "impact",
+    "transformative potential": "potential", "transformative": "notable",
+    "broad applicability": "broad use", "cutting-edge": "recent",
+    "tangible change": "change", "real-world scenarios": "practice",
+    "underscoring its significance": "showing its reach",
+    "underscore the significance": "show the reach",
+    "further cementing": "confirming", "exemplifies": "shows", "profound": "clear",
+}
+
+def _deflate(text: str) -> str:
+    for a, b in _DEFLATE.items():
+        text = re.sub(re.escape(a), b, text, flags=re.IGNORECASE)
     return text
 
 def _trim_words(text: str, hard_max: int = 165) -> str:
@@ -507,27 +535,34 @@ STRICT RULES:
             "drop none of their substance. You follow formatting rules exactly."
         )
         user = (
-            "Write a Research Excellence Framework (REF) impact paragraph.\n\n"
-            "=== STRUCTURE TO FOLLOW ===\n"
-            "This is a SKELETON, not content. Replace every <...> with THIS paper's own "
-            "approved facts and every [n] with a real reference number. Never output a "
-            "<...> placeholder literally, and do NOT reuse any wording from the skeleton:\n"
-            f"{_REF_STRUCTURE}\n\n"
+            "Write a UK Research Excellence Framework (REF) impact paragraph in the CONCRETE, "
+            "evidence-led style of a real REF submission.\n\n"
+            "=== STYLE (mandatory) ===\n"
+            "- EVERY sentence states a specific, verifiable fact: a number, or a NAMED "
+            "repository / patent / citing paper / venue / organisation. Lead with what the "
+            "paper introduced, then trace concrete downstream impact.\n"
+            "- NAME sources explicitly in the prose (e.g. \"the open-source library "
+            "facebookresearch/detectron\", \"a patent assigned to <assignee>\", "
+            "\"<Author> et al. (<year>)\"). Do not describe evidence generically.\n"
+            "- BANNED — never use these empty phrases: \"significant impact\", \"transformative\", "
+            "\"profound influence\", \"broad applicability\", \"underscoring its significance\", "
+            "\"exemplifies\", \"cutting-edge\", \"tangible change\", \"real-world scenarios\", "
+            "\"traceable pathway\", \"operational practice\".\n\n"
             "=== STRICT RULES ===\n"
-            f"1. One paragraph of about 150 words — aim for 140-160, and never fewer than 130.\n"
-            f"2. Refer to the authors as \"{etal}\" (use this et al. form; do not restate the title).\n"
-            "3. Incorporate EVERY approved sentence's fact; add no new facts.\n"
-            "4. MUST include at least THREE inline citations written as [1], [2], [3] (the numbers "
-            "from the reference list), each placed right after the fact it supports. Do not omit them.\n"
-            "5. Put **bold** markdown around EXACTLY THREE key impact phrases.\n"
-            "6. One flowing paragraph — no headings, no lists, no bullet points.\n\n"
-            f"=== APPROVED SENTENCES (weave in every one) ===\n{sent_block}\n\n"
+            "1. MAXIMUM 150 words. One flowing paragraph — no headings, lists or bullets.\n"
+            f"2. Refer to the authors as \"{etal}\".\n"
+            "3. Use ONLY the approved facts below; add nothing, invent nothing.\n"
+            "4. Include at least THREE inline citations as [1], [2], [3] (the reference numbers), "
+            "each right after the fact it supports.\n"
+            "5. Bold **exactly three** CONCRETE facts (a number, a named adopter, or a specific "
+            "outcome) — bold the FACT itself, never a vague phrase.\n\n"
+            f"=== APPROVED FACTS (weave in every one) ===\n{sent_block}\n\n"
             f"=== REFERENCE LIST (cite as [n]) ===\n{ref_block}\n\n"
-            f"Now write the ~150-word REF impact paragraph for {etal}:"
+            f"Now write the concrete REF impact paragraph (max 150 words) for {etal}:"
         )
-        summary = _call(system, user, max_tokens=460)
+        summary = _call(system, user, max_tokens=440)
         if summary:
-            summary = _ensure_bold(_trim_words(summary, hard_max=165))
+            summary = _ensure_bold(_deflate(_trim_words(summary, hard_max=150)))
             provider = _provider_label()
             logs.append(log("LLM", f"{provider.split(':')[0].title()} composed summary from {len(sentences)} approved sentences", model=provider, words=len(summary.split())))
             return summary, provider, logs
