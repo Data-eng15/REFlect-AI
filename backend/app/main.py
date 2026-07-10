@@ -10,7 +10,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .auth import create_linkedin_token, create_orcid_token, get_current_uid, get_current_user
@@ -23,8 +23,28 @@ from .models import AnalyzeRequest, AnalyzeResponse
 from .ref_beta import run_beta_ref
 from .services import analyze_paper, compose_summary
 from .validation import classify_query, validate_query
+from .dashboard_metrics import metrics
+from .dashboard_ui import DASHBOARD_HTML
 
 app = FastAPI(title="REFlect AI API", version="0.5.0")
+
+# Metrics collection middleware
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """Record request latency and basic metrics."""
+    start = time.time()
+    response = await call_next(request)
+    latency_ms = (time.time() - start) * 1000
+
+    # Skip recording for dashboard and health checks to avoid noise
+    if request.url.path not in ["/health", "/api/metrics", "/dashboard"]:
+        # Endpoints record their own cache status; middleware just records latency
+        if response.status_code < 400:
+            metrics.record_request(request.url.path, response.status_code, latency_ms, cached=False)
+        else:
+            metrics.record_request(request.url.path, response.status_code, latency_ms, cached=False)
+
+    return response
 
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 
@@ -628,3 +648,19 @@ async def routing_plan(request: Request, fields: str = "", title: str = "") -> d
     rate_limit(request, limit=60, window=60)
     field_list = [f.strip() for f in fields.split(",") if f.strip()]
     return plan_routing(fields=field_list, title=title)
+
+# ============================================================================
+# BACKEND OPERATIONS DASHBOARD
+# ============================================================================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def get_dashboard():
+    """Interactive backend operations dashboard."""
+    return DASHBOARD_HTML
+
+@app.get("/api/metrics")
+async def get_metrics() -> dict:
+    """Get current system metrics for the dashboard."""
+    stats = metrics.get_stats()
+    health = metrics.health_status()
+    return {**stats, "health_status": health}
