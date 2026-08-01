@@ -39,5 +39,3 @@ frontend/dist/
 # Build artifacts
 *.tsbuildinfo
 
-# Dissertation writeup — kept local (graded submission; avoid public/Turnitin self-match)
-docs/reflect_ai_dissertation.tex
