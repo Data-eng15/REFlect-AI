@@ -39,3 +39,6 @@ frontend/dist/
 # Build artifacts
 *.tsbuildinfo
 
+# Research writeups & submission materials — kept local only, never published
+docs/
+
